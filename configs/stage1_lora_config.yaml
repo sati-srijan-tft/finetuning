@@ -1,0 +1,61 @@
+### Stage 1: Thinker Fine-Tuning Configuration
+### Fine-tunes the LLM backbone for Hindi/Indic language understanding
+
+### model
+model_name_or_path: Qwen/Qwen3-Omni-30B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+# Target only core LLM projection layers — do NOT use "all"
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+### quantization
+# A100 80GB: comment out both lines below — BF16 30B model (~60GB) fits without quant,
+# giving higher quality and larger batch headroom.
+# A100 40GB: keep 4-bit quant.
+quantization_bit: 4
+quantization_method: bitsandbytes
+
+### dataset
+# Combines text instruction data + IndicVoices ASR samples (both in data.jsonl)
+dataset: indic_thinker_data
+template: qwen
+# Raised to 4096: audio tokens from Qwen Omni's encoder are ~60 tokens/sec,
+# so a 20-second clip consumes ~1200 tokens before the text response.
+cutoff_len: 4096
+max_samples: 50000
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 4
+dataloader_pin_memory: true
+
+### output
+output_dir: ./outputs/stage1_lora
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+
+### training hyperparameters
+per_device_train_batch_size: 1    # A100 80GB (no quant): raise to 2-4; keep 1 with 4-bit quant
+gradient_accumulation_steps: 16   # keep effective batch size = 16
+learning_rate: 2.0e-4
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true                        # A100 has native BF16 hardware — better than fp16 (wider dynamic range)
+gradient_checkpointing: true      # trades compute for VRAM
+flash_attn: fa2                   # Flash Attention 2: ~3x faster attention, ~50% less VRAM on A100
+optim: adamw_torch_fused          # fused AdamW kernel — ~15% faster optimizer step on A100/CUDA
+
+### evaluation — uncomment if you ran 02_prepare_stage1_data.py with --split_eval
+# eval_dataset: indic_thinker_eval
+# eval_steps: 500
+# evaluation_strategy: steps
+# load_best_model_at_end: true

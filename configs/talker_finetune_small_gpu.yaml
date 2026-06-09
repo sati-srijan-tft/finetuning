@@ -1,0 +1,94 @@
+### Stage 2: Talker Fine-Tuning Configuration — Small GPU Variant
+### Targets 2× 24 GB GPUs (e.g., 2× RTX 3090/4090) or a single A100 40 GB.
+### All training targets, LoRA settings, and hyperparameters are identical to
+### talker_finetune.yaml — only the memory-bound settings differ.
+###
+### VRAM reality check (frozen 30B backbone in FP16 ≈ 60 GB):
+###   2× 24 GB (tensor-parallel, this config) → ~30 GB/card — fits.
+###   1× 24 GB only                           → enable DeepSpeed CPU offload (see comments).
+###   A100 40 GB single card                  → fits; switch precision to bf16-mixed.
+
+name: "Qwen_Omni_Talker_Indic"
+
+trainer:
+  devices: 2                     # 2× 24 GB minimum; set to 1 only with DeepSpeed CPU offload
+  accelerator: gpu
+  max_epochs: 5
+  precision: 16-mixed            # FP16: consumer GPUs lack native BF16 hardware (A100/H100 only)
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 16    # up from 4 — smaller batch × more steps = same effective batch (32)
+  log_every_n_steps: 10
+  val_check_interval: 500
+  strategy: megatron             # NeMo Megatron strategy enables tensor/pipeline parallelism below
+
+  ### Single-GPU CPU-offload alternative (uncomment, remove strategy/megatron lines above):
+  # strategy: deepspeed_stage_3
+  # plugins:
+  #   - _target_: pytorch_lightning.plugins.DeepSpeedPlugin
+  #     config:
+  #       zero_optimization:
+  #         stage: 3
+  #         offload_optimizer: { device: cpu }
+  #         offload_param:     { device: cpu }
+
+model:
+  nemo_path: "/path/to/qwen_omni_thinker_tuned.nemo"   # same checkpoint as talker_finetune.yaml
+
+  freeze_llm: true
+  freeze_audio_encoder: true
+
+  # Tensor parallelism — splits the frozen 30B backbone across 2 cards (60 GB → 30 GB/card).
+  # Must match trainer.devices. Set both to 1 only when using DeepSpeed CPU offload.
+  tensor_model_parallel_size: 2
+  pipeline_model_parallel_size: 1
+
+  # Activation checkpointing: recomputes activations during the backward pass instead of
+  # storing them — trades ~30 % extra compute for a large reduction in activation VRAM.
+  activations_checkpoint_granularity: full
+  activations_checkpoint_method: uniform
+  activations_checkpoint_num_layers: 1
+
+  # Identical to A100 config — same LoRA targets, rank, and dropout
+  peft:
+    peft_scheme: "lora"
+    lora_rank: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+    target_modules: ["audio_decoder", "code_predictor"]
+
+  optim:
+    name: adamw
+    lr: 1.0e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0.01
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 200
+      min_lr: 1.0e-6
+
+  data:
+    train_ds:
+      manifest_filepath: "/path/to/train_manifest.json"
+      sample_rate: 24000          # unchanged — must match Qwen Omni native rate
+      batch_size: 2               # down from 8; primary VRAM lever — halve again (→1) if OOM
+      shuffle: true
+      num_workers: 4              # down from 8; smaller instances have fewer CPU cores
+      pin_memory: true
+
+    validation_ds:
+      manifest_filepath: "/path/to/val_manifest.json"
+      sample_rate: 24000
+      batch_size: 1               # down from 4
+      shuffle: false
+      num_workers: 2              # down from 4
+
+exp_manager:
+  exp_dir: "/path/to/outputs/stage2_talker"
+  name: "qwen_omni_indic_talker_small_gpu"
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    save_best_model: true
+    monitor: "val_loss"
+    mode: "min"
+    always_save_nemo: true

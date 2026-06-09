@@ -1,0 +1,67 @@
+### Stage 2: Talker Fine-Tuning Configuration (NVIDIA NeMo)
+### Fine-tunes audio decoder for natural Hindi/Indic speech synthesis
+### Requires Stage 1 merged model converted to .nemo format first
+
+name: "Qwen_Omni_Talker_Indic"
+
+trainer:
+  devices: 1
+  accelerator: gpu
+  max_epochs: 5
+  precision: bf16-mixed         # A100 has native BF16 — better stability and speed than fp16
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+  log_every_n_steps: 10
+  val_check_interval: 500
+
+model:
+  nemo_path: "/path/to/qwen_omni_thinker_tuned.nemo"   # output from 05_convert_to_nemo.sh
+
+  # Freeze everything trained in Stage 1
+  freeze_llm: true
+  freeze_audio_encoder: true
+
+  # Target only the audio synthesis / generation layers
+  peft:
+    peft_scheme: "lora"
+    lora_rank: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+    target_modules: ["audio_decoder", "code_predictor"]
+
+  optim:
+    name: adamw
+    lr: 1.0e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0.01
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 200
+      min_lr: 1.0e-6
+
+  data:
+    train_ds:
+      manifest_filepath: "/path/to/train_manifest.json"
+      sample_rate: 24000          # match Qwen Omni native rate
+      batch_size: 8
+      shuffle: true
+      num_workers: 8
+      pin_memory: true
+
+    validation_ds:
+      manifest_filepath: "/path/to/val_manifest.json"
+      sample_rate: 24000
+      batch_size: 4
+      shuffle: false
+      num_workers: 4
+
+exp_manager:
+  exp_dir: "/path/to/outputs/stage2_talker"
+  name: "qwen_omni_indic_talker"
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    save_best_model: true
+    monitor: "val_loss"
+    mode: "min"
+    always_save_nemo: true

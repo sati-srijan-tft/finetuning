@@ -1,0 +1,108 @@
+### Stage 2: Talker Fine-Tuning — NeMo-native Quantized Thinker
+###
+### The frozen Thinker (LLM backbone + audio encoder) is quantized via NVIDIA ModelOpt,
+### shrinking it from ~60 GB (BF16) to ~30 GB (INT8) or ~15 GB (W4A16).
+### The Talker (audio_decoder + code_predictor) is excluded from quantization and
+### trained normally with LoRA in full precision.
+###
+### Prerequisite: pip install nvidia-modelopt[torch]
+###
+### All paths, LoRA targets, and optimizer settings are identical to talker_finetune.yaml.
+
+name: "Qwen_Omni_Talker_Indic_QuantThinker"
+
+trainer:
+  devices: 1
+  accelerator: gpu
+  max_epochs: 5
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+  log_every_n_steps: 10
+  val_check_interval: 500
+
+model:
+  nemo_path: "/path/to/qwen_omni_thinker_tuned.nemo"   # same checkpoint as talker_finetune.yaml
+
+  freeze_llm: true
+  freeze_audio_encoder: true
+
+  # ── NeMo-native quantization (powered by nvidia-modelopt) ──────────────────
+  # Applied at model-load time before training begins.
+  # Only the frozen modules are quantized; Talker layers are excluded so their
+  # LoRA adapters train in full BF16 precision with no quantization noise.
+  quantization:
+    enabled: true
+
+    # Algorithm choices (pick one):
+    #   int8_sq  — INT8 SmoothQuant. Best quality, ~30 GB for 30B model.
+    #              Requires a calibration pass on real data (calibration_steps below).
+    #   w4a16    — INT4 weights + FP16 activations (AWQ). Most VRAM savings (~15 GB).
+    #              Slightly lower quality than INT8; no calibration needed for AWQ.
+    algorithm: int8_sq
+
+    # SmoothQuant-specific (only used when algorithm: int8_sq)
+    sq_alpha: 0.5           # balances quantization difficulty between weights and activations
+                            # range 0.0–1.0; 0.5 is the standard default
+
+    # AWQ-specific (only used when algorithm: w4a16)
+    awq_block_size: 128     # weight group size; 128 is standard
+
+    # Calibration — NeMo runs a forward pass on these many training batches before
+    # quantizing, so the quantization ranges are data-aware (required for int8_sq,
+    # optional but recommended for w4a16)
+    num_calib_steps: 512
+
+    # These modules are excluded from quantization and remain in BF16.
+    # They must match the Talker submodule names in the loaded .nemo model.
+    # Run: python -c "import nemo; m=...; print([n for n,_ in m.named_modules()])"
+    # to verify if the names below are correct for your checkpoint.
+    exclude_from_quantization:
+      - "audio_decoder"
+      - "code_predictor"
+  # ───────────────────────────────────────────────────────────────────────────
+
+  # LoRA — identical to talker_finetune.yaml
+  peft:
+    peft_scheme: "lora"
+    lora_rank: 8
+    lora_alpha: 16
+    lora_dropout: 0.05
+    target_modules: ["audio_decoder", "code_predictor"]
+
+  optim:
+    name: adamw
+    lr: 1.0e-4
+    betas: [0.9, 0.98]
+    weight_decay: 0.01
+    sched:
+      name: CosineAnnealing
+      warmup_steps: 200
+      min_lr: 1.0e-6
+
+  data:
+    train_ds:
+      manifest_filepath: "/path/to/train_manifest.json"
+      sample_rate: 24000
+      batch_size: 8
+      shuffle: true
+      num_workers: 8
+      pin_memory: true
+
+    validation_ds:
+      manifest_filepath: "/path/to/val_manifest.json"
+      sample_rate: 24000
+      batch_size: 4
+      shuffle: false
+      num_workers: 4
+
+exp_manager:
+  exp_dir: "/path/to/outputs/stage2_talker_quant"
+  name: "qwen_omni_indic_talker_quantized_thinker"
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    save_best_model: true
+    monitor: "val_loss"
+    mode: "min"
+    always_save_nemo: true
