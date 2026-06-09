@@ -2,7 +2,7 @@
 ### Fine-tunes the LLM backbone for Hindi/Indic language understanding
 
 ### model
-model_name_or_path: Qwen/Qwen3-Omni-30B
+model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
 trust_remote_code: true
 
 ### method

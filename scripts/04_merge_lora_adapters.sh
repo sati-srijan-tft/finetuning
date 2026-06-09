@@ -8,7 +8,7 @@
 
 set -e
 
-MODEL_PATH="Qwen/Qwen3-Omni-30B"          # base model (HF Hub or local path)
+MODEL_PATH="Qwen/Qwen3-Omni-30B-A3B-Instruct"          # base model (HF Hub or local path)
 ADAPTER_PATH="./outputs/stage1_lora"      # LoRA adapter output from Stage 1
 MERGED_PATH="./outputs/stage1_merged"     # destination for merged weights
 
