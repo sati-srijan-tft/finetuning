@@ -25,8 +25,17 @@ import argparse
 import json
 import random
 import shutil
+import os
 import sys
 from pathlib import Path
+from huggingface_hub import login
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# login to the huggingface account using it hf token
+
+login(token=os.getenv("HF_TOKEN"))
 
 # --- ASR prompt variations (randomly sampled per example for robustness) ---
 ASR_PROMPTS = [
