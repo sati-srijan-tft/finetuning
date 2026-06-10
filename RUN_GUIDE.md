@@ -22,6 +22,7 @@ finetuning/
 │   ├── 02_prepare_stage1_data.py    # Validate & copy data to LLaMA-Factory
 │   ├── 03_run_stage1_training.sh    # Run Stage 1 LoRA training
 │   ├── 04_merge_lora_adapters.sh    # Merge LoRA into base model
+│   ├── fix_data_jsonl.py            # One-shot fix: normalize array content → string format
 │   ├── 05_convert_to_nemo.sh        # Convert HF → .nemo for Stage 2
 │   ├── 06_prepare_stage2_manifest.py# Resample audio + build NeMo manifests
 │   ├── 07_run_stage2_training.sh    # Run Stage 2 NeMo TTS training
@@ -39,7 +40,7 @@ finetuning/
 ### Step 1 — Add your training data
 
 **Text instruction data** (optional but recommended to mix with ASR):
-Place `.jsonl` files in `data/`. Each line must follow the ChatML format:
+Place `.jsonl` files in `data/`. Each line must follow the ChatML/ShareGPT format:
 ```json
 {"messages": [
   {"role": "system",    "content": "आप एक सहायक AI हैं।"},
@@ -47,7 +48,24 @@ Place `.jsonl` files in `data/`. Each line must follow the ChatML format:
   {"role": "assistant", "content": "उत्तर..."}
 ]}
 ```
-`data/sample_data.jsonl` contains 5 starter Hindi examples you can build on.
+
+**Audio/ASR samples** use a string `content` with an `<audio>` tag plus a top-level `audios` list.
+All `content` fields must be strings — never arrays — to avoid PyArrow schema errors:
+```json
+{"messages": [
+  {"role": "system",    "content": "आप हिंदी ऑडियो को text में बदलने में सक्षम हैं।"},
+  {"role": "user",      "content": "<audio>इस ऑडियो को हिंदी में लिखें।"},
+  {"role": "assistant", "content": "ट्रांसक्रिप्ट यहाँ..."}
+], "audios": ["audio_data/indicvoices/filename.wav"]}
+```
+Audio paths in `audios` are relative to `LLaMA-Factory/data/`.
+
+`data/sample_data.jsonl` contains starter Hindi examples (text + one audio sample) you can build on.
+
+> **If you have an existing `data.jsonl` with old array-format content**, fix it before training:
+> ```bash
+> python scripts/fix_data_jsonl.py LLaMA-Factory/data/data.jsonl
+> ```
 
 Recommended text data sources:
 - **IndicInstruct** (AI4Bharat) — Hindi instruction pairs
@@ -73,6 +91,8 @@ rsync -avz ./finetuning/ user@gpu-instance:/workspace/finetuning/
 cd /workspace/finetuning
 bash scripts/01_setup_stage1.sh
 pip install datasets soundfile librosa   # extra deps for IndicVoices
+
+pip install torchcodec  #the newer version uses this instead of soundfile and librosa
 ```
 
 ### Step 4 — Prepare data (with IndicVoices ASR)
@@ -95,6 +115,8 @@ python scripts/02_prepare_stage1_data.py \
 
 This saves audio files to `LLaMA-Factory/data/audio_data/indicvoices/` and creates
 `data.jsonl` with interleaved text instruction + ASR entries.
+It also writes `LLaMA-Factory/data/dataset_info.json` with the required `"audios"` column mapping.
+If you copy data manually, make sure `dataset_info.json` includes `"audios": "audios"` in the columns block — without it LLaMA-Factory treats `<audio>` tags as literal text.
 
 ### Step 5 — Start training
 
@@ -198,7 +220,7 @@ pip install bitsandbytes
 #   model_path → ./LLaMA-Factory/outputs/stage1_merged
 #   data.train_manifest / data.val_manifest → your manifest paths
 
-python scripts/07_run_stage2_training.sh --config talker_finetune_bnb.yaml
+bash scripts/07_run_stage2_training.sh --config talker_finetune_bnb.yaml
 ```
 
 Output lands in `outputs/stage2_talker_bnb/`.

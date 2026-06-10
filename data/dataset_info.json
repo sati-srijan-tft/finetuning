@@ -3,7 +3,8 @@
     "file_name": "data.jsonl",
     "formatting": "sharegpt",
     "columns": {
-      "messages": "messages"
+      "messages": "messages",
+      "audios": "audios"
     },
     "tags": {
       "role_tag": "role",

@@ -50,6 +50,7 @@ Create a file named `dataset_info.json` and your core training data in a `data.j
 ```
 
 #### Audio-to-Text Comprehension (Speech Recognition) Example
+Audio samples must use string `content` with an `<audio>` tag, and list audio files in a top-level `audios` key. All `content` fields across text and audio samples must be strings — never arrays — to avoid PyArrow schema errors when loading with HuggingFace datasets.
 ```json
 {
   "messages": [
@@ -59,20 +60,17 @@ Create a file named `dataset_info.json` and your core training data in a `data.j
     },
     {
       "role": "user",
-      "content": [
-        {"audio": "audio_data/hindi_clip_001.wav"},
-        {"text": "Please transcribe what is said in this audio."}
-      ]
+      "content": "<audio>Please transcribe what is said in this audio."
     },
     {
       "role": "assistant",
-      "content": [
-        {"text": "ऑडियो में वक्ता कह रहा है कि आज मौसम बहुत सुहावना है।"}
-      ]
+      "content": "ऑडियो में वक्ता कह रहा है कि आज मौसम बहुत सुहावना है।"
     }
-  ]
+  ],
+  "audios": ["audio_data/hindi_clip_001.wav"]
 }
 ```
+The `<audio>` tag marks where the audio is injected in the prompt. Audio paths in `audios` are relative to `LLaMA-Factory/data/`.
 
 ### 2. Environment Setup
 Run these commands on your cloud GPU instance:
@@ -89,7 +87,8 @@ Move your data files into `LLaMA-Factory/data/` and append your dataset schema t
   "file_name": "data.jsonl",
   "formatting": "sharegpt",
   "columns": {
-    "messages": "messages"
+    "messages": "messages",
+    "audios": "audios"
   },
   "tags": {
     "role_tag": "role",
@@ -101,19 +100,26 @@ Move your data files into `LLaMA-Factory/data/` and append your dataset schema t
 ```
 
 ### 4. Training Execution
-Launch the web interface to configure your training parameters:
+Launch training via the CLI using the provided config and scripts (see `RUN_GUIDE.md` for the full step-by-step):
 ```bash
-llamafactory-cli webui
+cd LLaMA-Factory
+bash ../scripts/03_run_stage1_training.sh
+
+# Multi-GPU (e.g. 2× RTX 4090):
+bash ../scripts/03_run_stage1_training.sh --multi_gpu
 ```
 
-#### Essential WebUI Configurations
-*   **Model Name:** `Qwen/Qwen3-Omni-30B`
+Key parameters configured in `configs/stage1_lora_config.yaml`:
+*   **Model Name:** `Qwen/Qwen3-Omni-30B-A3B-Instruct`
 *   **Fine-tuning Method:** `LoRA`
-*   **Quantization:** `4-bit` (Crucial for VRAM optimization)
+*   **Quantization:** `4-bit` (crucial for VRAM optimization)
 *   **Dataset:** `indic_thinker_data`
-*   **LoRA Target Modules:** Manually target the core LLM projection layers: `q_proj, v_proj, k_proj, o_proj, gate_proj, up_proj, down_proj` (Do **not** select `all`).
+*   **LoRA Target Modules:** `q_proj, v_proj, k_proj, o_proj, gate_proj, up_proj, down_proj` (do **not** target `all` — avoids training audio encoder weights)
 
-Once training concludes, navigate to the **Export** tab in the UI to permanently merge your newly trained LoRA adapters back into the base Qwen 3 Omni model weights.
+Once training concludes, merge the LoRA adapters into the base model:
+```bash
+bash ../scripts/04_merge_lora_adapters.sh
+```
 
 ---
 
@@ -137,7 +143,7 @@ Convert your studio-quality voice datasets (e.g., IndicTTS) into a standard text
 {"audio_filepath": "/data/indic_tts/hindi/clip_001.wav", "duration": 4.2, "text": "नमस्ते, मैं आपकी कैसे सहायता कर सकता हूँ?"}
 {"audio_filepath": "/data/indic_tts/hindi/clip_002.wav", "duration": 2.8, "text": "लेनदेन को सफलतापूर्वक सत्यापित किया गया है।"}
 ```
-> **Note:** Ensure all target audio is cleanly resampled to the model’s native expected frequency (typically 16kHz or 24kHz) before generating the manifest file.
+> **Note:** Stage 2 (Talker / TTS) audio must be resampled to **24 kHz** — the native rate of Qwen Omni’s audio decoder. Stage 1 (Thinker / ASR) audio uses **16 kHz** (WhisperFeatureExtractor). Mixing rates between stages is intentional and correct.
 
 ### 3. Creating the Training Configuration
 Create a configuration file named `talker_finetune.yaml` to enforce component isolation:
@@ -148,8 +154,8 @@ model:
   nemo_path: "/path/to/qwen_omni_thinker_tuned.nemo"
   
   # Completely freeze the language processing components
-  freeze_llm: True
-  freeze_audio_encoder: True 
+  freeze_llm: true
+  freeze_audio_encoder: true
   
   # Target the acoustic projection/generation layers
   peft:

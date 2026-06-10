@@ -187,20 +187,21 @@ def load_indicvoices(
             sf.write(str(wav_path), audio_array, sr)
 
         # --- Build ChatML sample ---
-        # Path is relative to LLaMA-Factory/data/ which is where LLaMA-Factory resolves media
+        # Path is relative to LLaMA-Factory/data/ which is where LLaMA-Factory resolves media.
+        # content must be a string (not array) for PyArrow schema consistency with text samples.
+        # Audio path goes in the top-level "audios" list; <audio> tag marks its position.
         rel_audio_path = f"audio_data/indicvoices/{wav_filename}"
+        prompt = rng.choice(ASR_PROMPTS)
         sample = {
             "messages": [
                 {"role": "system", "content": ASR_SYSTEM},
                 {
                     "role": "user",
-                    "content": [
-                        {"audio": rel_audio_path},
-                        {"text": rng.choice(ASR_PROMPTS)},
-                    ],
+                    "content": f"<audio>{prompt}",
                 },
                 {"role": "assistant", "content": transcript},
-            ]
+            ],
+            "audios": [rel_audio_path],
         }
         samples.append(sample)
 
@@ -219,7 +220,10 @@ def build_dataset_info(output_dir: Path, has_eval: bool) -> None:
     base_entry = {
         "file_name": "data.jsonl",
         "formatting": "sharegpt",
-        "columns": {"messages": "messages"},
+        "columns": {
+            "messages": "messages",
+            "audios": "audios",
+        },
         "tags": {
             "role_tag": "role",
             "content_tag": "content",
