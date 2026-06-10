@@ -25,7 +25,7 @@ quantization_method: bitsandbytes
 ### dataset
 # Combines text instruction data + IndicVoices ASR samples (both in data.jsonl)
 dataset: indic_thinker_data
-template: qwen
+template: qwen3_omni_nothink
 # Raised to 4096: audio tokens from Qwen Omni's encoder are ~60 tokens/sec,
 # so a 20-second clip consumes ~1200 tokens before the text response.
 cutoff_len: 4096
