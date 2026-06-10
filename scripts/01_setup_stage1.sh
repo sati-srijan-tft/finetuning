@@ -34,9 +34,10 @@ cd LLaMA-Factory
 pip install -e ".[metrics,bitsandbytes]" --upgrade
 
 # --- Flash Attention 2 ---
-# ACTUAL pre-built wheel fetching to avoid the CUDA source compilation
+# Using --extra-index-url allows pip to fetch 'ninja' from standard PyPI 
+# while still getting the pre-compiled Flash Attention wheel from PyTorch.
 echo "Fetching pre-compiled Flash Attention..."
-pip install flash-attn-3 --index-url https://download.pytorch.org/whl/cu128
+pip install flash-attn-3 --extra-index-url https://download.pytorch.org/whl/cu128
 
 # --- Verify GPU is visible ---
 python -c "import torch; print(f'\nCUDA available: {torch.cuda.is_available()}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}'); print(f'PyTorch Version: {torch.__version__}')"
