@@ -94,7 +94,8 @@ Move your data files into `LLaMA-Factory/data/` and append your dataset schema t
     "role_tag": "role",
     "content_tag": "content",
     "user_tag": "user",
-    "assistant_tag": "assistant"
+    "assistant_tag": "assistant",
+    "system_tag": "system"
   }
 }
 ```

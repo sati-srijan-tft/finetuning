@@ -115,8 +115,10 @@ python scripts/02_prepare_stage1_data.py \
 
 This saves audio files to `LLaMA-Factory/data/audio_data/indicvoices/` and creates
 `data.jsonl` with interleaved text instruction + ASR entries.
-It also writes `LLaMA-Factory/data/dataset_info.json` with the required `"audios"` column mapping.
-If you copy data manually, make sure `dataset_info.json` includes `"audios": "audios"` in the columns block — without it LLaMA-Factory treats `<audio>` tags as literal text.
+It also writes `LLaMA-Factory/data/dataset_info.json` with the required column and tag mappings.
+If you copy data manually, ensure `dataset_info.json` contains both of these — omitting either causes silent data loss:
+- `"audios": "audios"` in the `columns` block — without it, `<audio>` tags are treated as literal text
+- `"system_tag": "system"` in the `tags` block — without it, every sample with a system message is rejected with "Invalid role tag"
 
 ### Step 5 — Start training
 

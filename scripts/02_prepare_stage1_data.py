@@ -229,6 +229,7 @@ def build_dataset_info(output_dir: Path, has_eval: bool) -> None:
             "content_tag": "content",
             "user_tag": "user",
             "assistant_tag": "assistant",
+            "system_tag": "system",
         },
     }
     info = {"indic_thinker_data": base_entry}
