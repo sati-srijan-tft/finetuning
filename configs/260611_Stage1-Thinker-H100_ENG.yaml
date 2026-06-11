@@ -1,0 +1,66 @@
+### Stage 1: Thinker Fine-Tuning — H100 80GB (HuggingFace / LLaMA-Factory)
+### Qwen3-Omni-30B-A3B is an MoE model: 30B stored weights (≈60 GB BF16) but
+### only ~3B active per forward pass, so activation memory stays manageable.
+### No quantization: H100 80 GB comfortably holds the full BF16 model + LoRA.
+
+### model
+model_name_or_path: Qwen/Qwen3-Omni-30B-A3B-Instruct
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 32                   # doubled vs A100 config — H100 has headroom for a larger adapter
+lora_alpha: 64
+lora_dropout: 0.05
+lora_target: q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj
+
+### quantization
+# H100 80 GB: NO quantization. Full BF16 preserves gradient quality and
+# avoids dequant overhead. Comment back in ONLY if you observe OOM.
+# quantization_bit: 4
+# quantization_method: bitsandbytes
+
+### dataset
+dataset: indic_thinker_data
+template: qwen3_omni_nothink
+cutoff_len: 4096
+max_samples: 50000
+overwrite_cache: true
+preprocessing_num_workers: 16    # H100 hosts typically have 32–64 CPU cores
+dataloader_num_workers: 8
+dataloader_pin_memory: true
+
+### output
+output_dir: ./outputs/stage1_lora_h100
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+
+### training hyperparameters
+per_device_train_batch_size: 2   # H100: 2× the A100 batch; raise to 4 if VRAM allows
+gradient_accumulation_steps: 8   # effective batch = 2 × 8 = 16 (same as A100 config)
+learning_rate: 2.0e-4
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+gradient_checkpointing: true     # keep enabled — 60 GB weights leave ~20 GB for activations;
+                                 # checkpointing trades ~30% compute for activation memory safety
+flash_attn: fa2                  # FA2 is stable on Hopper; switch to fa3 once LLaMA-Factory
+                                 # officially ships Flash Attention 3 support for H100
+optim: adamw_torch_fused         # CUDA fused kernel — ~15% faster optimizer step
+
+### H100-specific extras (passed as TrainingArguments kwargs)
+tf32: true                       # TF32 is enabled by default on Hopper but explicit is safer;
+                                 # gives A100-quality results at TF32 speed for matmuls
+ddp_find_unused_parameters: false  # MoE models have conditional paths; set to true if you see
+                                   # "unused parameter" DDP errors
+
+### evaluation — uncomment if you ran 02_prepare_stage1_data.py with --split_eval
+# eval_dataset: indic_thinker_eval
+# eval_steps: 500
+# evaluation_strategy: steps
+# load_best_model_at_end: true

@@ -12,26 +12,31 @@ finetuning/
 │           ├── clip_001.wav
 │           └── clip_001.txt    # Transcript for each .wav
 ├── configs/
-│   ├── stage1_lora_config.yaml              # Stage 1: LoRA training config
-│   ├── talker_finetune.yaml                 # Stage 2: NeMo TTS config (A100 80GB baseline)
-│   ├── talker_finetune_small_gpu.yaml       # Stage 2: 2× 24GB or A100 40GB variant
-│   ├── talker_finetune_bnb.yaml             # Stage 2: BitsAndBytes HF path (no NeMo)
-│   └── talker_finetune_quantized_thinker.yaml # Stage 2: NeMo + quantized frozen Thinker
+│   ├── stage1_lora_config.yaml                    # Stage 1: LoRA training config (A100)
+│   ├── talker_finetune_bnb.yaml                   # Stage 2: HF path, 24 GB GPU (4-bit Thinker)
+│   ├── 260611_Stage2-Talker-H100_ENG.yaml         # Stage 2: HF path, H100 80 GB (8-bit Thinker) ← recommended
+│   ├── talker_finetune.yaml                       # [NeMo — unusable for Qwen] A100 80GB baseline
+│   ├── talker_finetune_small_gpu.yaml             # [NeMo — unusable for Qwen] 2× 24GB variant
+│   └── talker_finetune_quantized_thinker.yaml     # [NeMo — unusable for Qwen] ModelOpt quant
 ├── scripts/
-│   ├── 00_prepare_indicTTS_hindi.py # Download SPRINGLab/IndicTTS-Hindi + build NeMo manifests
-│   ├── 01_setup_stage1.sh           # Install LLaMA-Factory on GPU instance
-│   ├── 02_prepare_stage1_data.py    # Validate & copy data to LLaMA-Factory
-│   ├── 03_run_stage1_training.sh    # Run Stage 1 LoRA training
-│   ├── 04_merge_lora_adapters.sh    # Merge LoRA into base model
-│   ├── fix_data_jsonl.py            # One-shot fix: normalize array content → string format
-│   ├── 05_convert_to_nemo.sh        # Convert HF → .nemo for Stage 2
-│   ├── 06_prepare_stage2_manifest.py# Resample audio + build NeMo manifests (generic)
-│   ├── 07_run_stage2_training.sh    # Run Stage 2 NeMo TTS training
-│   └── 08_test_inference.py         # Verify Stage 1 model responds in Hindi
-└── outputs/                    # Created automatically during training
-    ├── stage1_lora/            # LoRA adapter checkpoints
-    ├── stage1_merged/          # Merged HF model
-    └── stage2_talker/          # Final NeMo TTS checkpoints
+│   ├── 00_prepare_indicTTS_hindi.py  # Download SPRINGLab/IndicTTS-Hindi + build manifests
+│   ├── 01_setup_stage1.sh            # Install LLaMA-Factory on GPU instance
+│   ├── 02_prepare_stage1_data.py     # Validate & copy data to LLaMA-Factory
+│   ├── 03_run_stage1_training.sh     # Run Stage 1 LoRA training
+│   ├── 04_merge_lora_adapters.sh     # Merge LoRA into base model
+│   ├── fix_data_jsonl.py             # One-shot fix: normalize array content → string format
+│   ├── 05_convert_to_nemo.sh         # [NeMo — unusable for Qwen] HF → .nemo conversion
+│   ├── 06_prepare_stage2_manifest.py # Resample audio + build JSON manifests
+│   ├── 07_run_stage2_training.sh     # Run Stage 2 training (HF or NeMo)
+│   ├── 08_test_inference.py          # Verify Stage 1 model responds in Hindi
+│   ├── 10_run_stage2_hf.py           # HF Trainer for Stage 2 (called by 07_run_stage2_training.sh)
+│   └── 11_merge_stage2_lora.py      # Merge Stage 2 LoRA → final standalone model
+└── outputs/                     # Created automatically during training
+    ├── stage1_lora/             # LoRA adapter checkpoints
+    ├── stage1_merged/           # Merged HF model (base for Stage 2)
+    ├── stage2_talker_bnb/       # Stage 2 HF adapter (24 GB path)
+    ├── stage2_talker_h100/      # Stage 2 HF adapter (H100 path)
+    └── final_model/             # Final merged model — Thinker + Talker, ready for inference
 ```
 
 ---
@@ -153,6 +158,10 @@ python scripts/08_test_inference.py \
 
 ## Stage 2: Fine-Tune the Talker (Voice Synthesis)
 
+> **NeMo is not an option for Qwen models.** NeMo 2.0 does not include HF → NeMo conversion
+> scripts for Qwen Omni. The NeMo configs (`talker_finetune*.yaml`) are kept for reference but
+> cannot be used until upstream NeMo adds support. **Use the HuggingFace path below.**
+
 ### Step 1 — Prepare audio data
 
 **Recommended: SPRINGLab/IndicTTS-Hindi (HuggingFace)**
@@ -192,80 +201,69 @@ python scripts/06_prepare_stage2_manifest.py \
     --split_eval
 ```
 
-### Step 2 — Convert Stage 1 model to NeMo format
+### Step 2 — Install HF dependencies
 
 ```bash
-bash scripts/05_convert_to_nemo.sh
+pip install transformers peft bitsandbytes accelerate soundfile
+# Only needed if your audio is not already at 24 kHz:
+pip install librosa
 ```
 
-### Step 3 — Choose a Stage 2 config and update it
+### Step 3 — Choose a config and set the paths
 
-Pick the config that matches your hardware, then fill in the three placeholder paths:
-
-| Config file | Target hardware | Thinker memory | Notes |
+| Config file | Target hardware | Thinker quant | Flag |
 |---|---|---|---|
-| `talker_finetune.yaml` | 1× A100 80 GB | ~60 GB BF16 | Baseline; highest quality |
-| `talker_finetune_small_gpu.yaml` | 2× 24 GB or 1× A100 40 GB | ~30 GB/card (tensor-parallel) | See DeepSpeed CPU-offload comment for single 24 GB |
-| `talker_finetune_bnb.yaml` | 1× 24 GB | ~15 GB (4-bit NF4) | HuggingFace path — no NeMo conversion needed |
-| `talker_finetune_quantized_thinker.yaml` | 1× A100 80 GB | ~30 GB INT8 or ~15 GB W4A16 | NeMo-native quant; requires `nvidia-modelopt` |
+| `260611_Stage2-Talker-H100_ENG.yaml` | H100 80 GB | 8-bit (~30 GB) | `--hf_h100` |
+| `talker_finetune_bnb.yaml` | Any 24 GB GPU | 4-bit NF4 (~15 GB) | `--hf` |
 
-In your chosen config, set:
-- `model.nemo_path` (or `model_path` for the BnB config) → path to your checkpoint
-- `model.data.train_ds.manifest_filepath` → `./manifests/train_manifest.json`
-- `model.data.validation_ds.manifest_filepath` → `./manifests/val_manifest.json`
-- `exp_manager.exp_dir` → where you want checkpoints saved
+In your chosen config, update the three placeholder paths:
+- `model_path` → `./LLaMA-Factory/outputs/stage1_merged`
+- `data.train_manifest` → `./manifests/train_manifest.json`
+- `data.val_manifest` → `./manifests/val_manifest.json`
 
-#### Small-GPU config extra steps
+### Step 4 — Run Stage 2 training
 
 ```bash
-# 2× GPU tensor-parallel run (already the default in talker_finetune_small_gpu.yaml)
-bash scripts/07_run_stage2_training.sh --config talker_finetune_small_gpu.yaml
+# H100 80 GB (recommended)
+bash scripts/07_run_stage2_training.sh --hf_h100
 
-# Single 24 GB card: uncomment the DeepSpeed block in the config, then:
-bash scripts/07_run_stage2_training.sh --config talker_finetune_small_gpu.yaml
+# 24 GB GPU
+bash scripts/07_run_stage2_training.sh --hf
+
+# Explicit config override (auto-detects HF vs NeMo from the file)
+bash scripts/07_run_stage2_training.sh --config 260611_Stage2-Talker-H100_ENG.yaml
 ```
 
-#### BitsAndBytes (HF) path — no NeMo needed
+Multi-GPU is handled automatically — `torchrun` is used when `nvidia-smi` detects more than one GPU.
 
-Skip steps 1–2 above (no NeMo conversion required). Use the Stage 1 merged model directly:
+Output lands in the `output_dir` set in the config (`outputs/stage2_talker_h100/` or `outputs/stage2_talker_bnb/`).
+
+### Step 5 — Merge Stage 2 LoRA into the final model
+
+Stage 2 training saves only the LoRA adapter. This step bakes it into `stage1_merged` to produce
+a single standalone HuggingFace checkpoint ready for inference or deployment.
 
 ```bash
-# Install extra dep
-pip install bitsandbytes
+# Auto-detects stage2_talker_h100 or stage2_talker_bnb automatically
+python scripts/11_merge_stage2_lora.py
 
-# Edit configs/talker_finetune_bnb.yaml:
-#   model_path → ./LLaMA-Factory/outputs/stage1_merged
-#   data.train_manifest / data.val_manifest → your manifest paths
-
-bash scripts/07_run_stage2_training.sh --config talker_finetune_bnb.yaml
+# Explicit paths
+python scripts/11_merge_stage2_lora.py \
+    --base_model  ./LLaMA-Factory/outputs/stage1_merged \
+    --adapter     ./outputs/stage2_talker_h100 \
+    --output_dir  ./outputs/final_model
 ```
 
-Output lands in `outputs/stage2_talker_bnb/`.
+The merge runs on CPU in bfloat16 — no GPU needed, but requires enough RAM to hold the model
+(~60 GB for the 30B model). Output is sharded into 4 GB safetensor files in `outputs/final_model/`.
 
-#### Quantized Thinker (NeMo-native)
-
-Requires NeMo conversion (step 2). Extra dependency:
-
-```bash
-pip install nvidia-modelopt[torch]
-```
-
-Edit `configs/talker_finetune_quantized_thinker.yaml`:
-- `quantization.algorithm`: `int8_sq` (30 GB, best quality) or `w4a16` (15 GB, most savings)
-- `quantization.num_calib_steps`: 512 default; raise to 1024 for better INT8 accuracy
-- `quantization.exclude_from_quantization`: verify module names match your `.nemo` checkpoint  
-  (run `python -c "import nemo; m=<load model>; print([n for n,_ in m.named_modules()])"`)
+### Step 6 — Test the final model
 
 ```bash
-bash scripts/07_run_stage2_training.sh --config talker_finetune_quantized_thinker.yaml
-```
-
-Output lands in `outputs/stage2_talker_quant/`.
-
-### Step 4 — Run Stage 2 training (baseline / A100 80 GB)
-
-```bash
-bash scripts/07_run_stage2_training.sh
+python scripts/08_test_inference.py \
+    --model_path ./outputs/final_model \
+    --load_in_4bit \
+    --prompt "भारत के बारे में बताओ।"
 ```
 
 ---
@@ -280,10 +278,9 @@ bash scripts/07_run_stage2_training.sh
 | `num_train_epochs` | stage1_lora_config.yaml | 3–5 for instruction tuning |
 | `learning_rate` | stage1_lora_config.yaml | 1e-4 to 3e-4 for LoRA |
 | `target_sr` | 06_prepare_stage2_manifest.py | Must match Qwen Omni native rate (24 kHz) |
-| `batch_size` (NeMo configs) | talker_finetune*.yaml | 8 on A100 80GB; 2 on 24GB cards; 1 for validation |
-| `accumulate_grad_batches` | talker_finetune_small_gpu.yaml | 16 to keep effective batch = 32; raise if OOM |
-| `tensor_model_parallel_size` | talker_finetune_small_gpu.yaml | Must equal `trainer.devices` |
-| `quantization.algorithm` | talker_finetune_quantized_thinker.yaml | `int8_sq` (quality) vs `w4a16` (VRAM) |
-| `quantization.sq_alpha` | talker_finetune_quantized_thinker.yaml | 0.0–1.0; 0.5 is standard SmoothQuant default |
-| `bnb_4bit_compute_dtype` | talker_finetune_bnb.yaml | `bfloat16` on A100; `float16` on consumer GPUs |
-| `talker_module_regex` | talker_finetune_bnb.yaml | Adjust prefix if model inspection shows different name |
+| `lora.rank` | Stage 2 HF configs | 8–32; H100 config uses 16, BnB uses 8 |
+| `training.per_device_train_batch_size` | Stage 2 HF configs | 8 on H100; 2 on 24 GB — reduce if OOM |
+| `training.gradient_accumulation_steps` | Stage 2 HF configs | Adjust to keep effective batch = 32 |
+| `quantization.load_in_8bit` | 260611_Stage2-Talker-H100_ENG.yaml | Switch to `load_in_4bit` if OOM on H100 |
+| `quantization.bnb_4bit_compute_dtype` | talker_finetune_bnb.yaml | `bfloat16` on A100/H100; `float16` on consumer GPUs |
+| `lora.talker_module_regex` | Stage 2 HF configs | If no modules match at startup, the script prints an inspect command; update this regex |

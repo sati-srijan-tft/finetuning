@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""
+Stage 2 HuggingFace Trainer for Qwen Omni Talker fine-tuning.
+
+Loads the Stage 1 merged model, freezes the Thinker (quantized via BitsAndBytes),
+applies LoRA to Talker modules via PEFT, and fine-tunes on TTS manifests.
+
+Usage:
+    python scripts/10_run_stage2_hf.py --config configs/260611_Stage2-Talker-H100_ENG.yaml
+    python scripts/10_run_stage2_hf.py --config configs/talker_finetune_bnb.yaml
+
+Prerequisites:
+    pip install transformers peft bitsandbytes accelerate soundfile
+    # If audio in manifests is not pre-resampled to 24 kHz:
+    pip install librosa
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List
+
+import torch
+import yaml
+from datasets import Dataset
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import (
+    AutoModelForCausalLM,
+    AutoProcessor,
+    BitsAndBytesConfig,
+    Trainer,
+    TrainingArguments,
+)
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def build_bnb_config(quant: dict) -> BitsAndBytesConfig:
+    if quant.get("load_in_8bit"):
+        return BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=quant.get("llm_int8_threshold", 6.0),
+            llm_int8_has_fp16_weight=quant.get("llm_int8_has_fp16_weight", False),
+        )
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type=quant.get("bnb_4bit_quant_type", "nf4"),
+        bnb_4bit_use_double_quant=quant.get("bnb_4bit_use_double_quant", True),
+    )
+
+
+# ---------------------------------------------------------------------------
+# LoRA target discovery
+# ---------------------------------------------------------------------------
+
+def find_talker_targets(model, regex: str) -> List[str]:
+    """
+    Match full dotted module names against the regex, then return the unique
+    bare names (last component) that PEFT's target_modules expects.
+
+    If nothing matches, print a helper command so you can inspect the real names.
+    """
+    matched_full = [name for name, _ in model.named_modules() if re.fullmatch(regex, name)]
+    if not matched_full:
+        print(
+            f"\nWARNING: talker_module_regex '{regex}' matched no modules.\n"
+            "Inspect the model to find the right prefix:\n\n"
+            f"  python -c \"\n"
+            f"  from transformers import AutoModelForCausalLM\n"
+            f"  m = AutoModelForCausalLM.from_pretrained('{model.config._name_or_path}', "
+            f"trust_remote_code=True)\n"
+            f"  print([n for n,_ in m.named_modules()])\n"
+            f"  \"\n\n"
+            "Then update talker_module_regex in your config and re-run.\n"
+        )
+        return []
+    unique_bare = list({n.split(".")[-1] for n in matched_full})
+    print(f"  LoRA targets: {len(matched_full)} modules → bare names: {unique_bare}")
+    return unique_bare
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+def load_manifest(path: str, min_dur: float, max_dur: float) -> List[dict]:
+    entries = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            dur = entry.get("duration", max_dur)
+            if min_dur <= dur <= max_dur:
+                entries.append(entry)
+    return entries
+
+
+class TalkerDataCollator:
+    """
+    Loads audio from manifest entries and feeds them to the model processor.
+
+    Manifest format (produced by 06_prepare_stage2_manifest.py):
+        {"audio_filepath": "/path/clip.wav", "text": "transcript", "duration": 2.5}
+
+    The processor encodes (text, audio) pairs into input_ids that include both
+    text tokens and Talker audio-codec tokens; labels mirror input_ids with
+    padding positions masked to -100 for the causal LM loss.
+
+    NOTE: Qwen2.5-Omni's processor API may differ from the generic call below.
+    If you get a TypeError, check:
+        from transformers import AutoProcessor
+        p = AutoProcessor.from_pretrained("<model_path>", trust_remote_code=True)
+        help(p)
+    and adjust the keyword arguments accordingly.
+    """
+
+    def __init__(self, processor, sample_rate: int):
+        self.processor = processor
+        self.sample_rate = sample_rate
+
+    def __call__(self, batch: List[dict]) -> Dict[str, torch.Tensor]:
+        import soundfile as sf
+
+        texts, audios = [], []
+        for entry in batch:
+            texts.append(entry.get("text", ""))
+            waveform, sr = sf.read(entry["audio_filepath"], dtype="float32")
+            if sr != self.sample_rate:
+                try:
+                    import librosa
+                    waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.sample_rate)
+                except ImportError:
+                    raise RuntimeError(
+                        f"Audio at {entry['audio_filepath']} has sr={sr}, expected {self.sample_rate}. "
+                        "Install librosa to auto-resample: pip install librosa"
+                    )
+            audios.append(waveform)
+
+        encoded = self.processor(
+            text=texts,
+            audios=audios,
+            sampling_rate=self.sample_rate,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+
+        labels = encoded["input_ids"].clone()
+        if "attention_mask" in encoded:
+            labels[encoded["attention_mask"] == 0] = -100
+        encoded["labels"] = labels
+        return encoded
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True, help="Path to the YAML training config")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    data_cfg  = cfg["data"]
+    train_cfg = cfg["training"]
+    lora_cfg  = cfg["lora"]
+    quant_cfg = cfg.get("quantization", {})
+
+    print(f"\n=== Stage 2 Talker fine-tuning (HuggingFace) ===")
+    print(f"Config : {args.config}")
+    print(f"Model  : {cfg['model_path']}")
+
+    # --- Model ---
+    bnb_config = build_bnb_config(quant_cfg) if quant_cfg else None
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg["model_path"],
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    processor = AutoProcessor.from_pretrained(cfg["model_path"], trust_remote_code=True)
+
+    # Freeze everything; PEFT will unfreeze adapter params
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # --- LoRA ---
+    target_modules = find_talker_targets(model, lora_cfg["talker_module_regex"])
+    if not target_modules:
+        sys.exit(1)
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_cfg["rank"],
+        lora_alpha=lora_cfg["alpha"],
+        lora_dropout=lora_cfg["dropout"],
+        target_modules=target_modules,
+        bias="none",
+    )
+    model = get_peft_model(model, peft_config)
+    model.print_trainable_parameters()
+
+    # --- Data ---
+    train_entries = load_manifest(
+        data_cfg["train_manifest"],
+        min_dur=data_cfg.get("min_duration", 0.5),
+        max_dur=data_cfg.get("max_duration", 30.0),
+    )
+    val_entries = load_manifest(
+        data_cfg["val_manifest"],
+        min_dur=data_cfg.get("min_duration", 0.5),
+        max_dur=data_cfg.get("max_duration", 30.0),
+    )
+    print(f"Train samples: {len(train_entries)}  |  Val samples: {len(val_entries)}")
+
+    collator = TalkerDataCollator(processor=processor, sample_rate=data_cfg["sample_rate"])
+
+    # --- TrainingArguments ---
+    training_args = TrainingArguments(
+        output_dir=train_cfg["output_dir"],
+        num_train_epochs=train_cfg["num_train_epochs"],
+        per_device_train_batch_size=train_cfg["per_device_train_batch_size"],
+        per_device_eval_batch_size=train_cfg["per_device_eval_batch_size"],
+        gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
+        learning_rate=train_cfg["learning_rate"],
+        lr_scheduler_type=train_cfg["lr_scheduler_type"],
+        warmup_steps=train_cfg["warmup_steps"],
+        bf16=train_cfg.get("bf16", True),
+        tf32=train_cfg.get("tf32", False),
+        gradient_checkpointing=train_cfg.get("gradient_checkpointing", False),
+        optim=train_cfg.get("optim", "adamw_torch_fused"),
+        logging_steps=train_cfg.get("logging_steps", 10),
+        save_steps=train_cfg.get("save_steps", 500),
+        evaluation_strategy="steps",
+        eval_steps=train_cfg.get("save_steps", 500),
+        load_best_model_at_end=train_cfg.get("load_best_model_at_end", True),
+        metric_for_best_model=train_cfg.get("metric_for_best_model", "eval_loss"),
+        dataloader_num_workers=train_cfg.get("dataloader_num_workers", 4),
+        dataloader_pin_memory=train_cfg.get("dataloader_pin_memory", True),
+        ddp_find_unused_parameters=train_cfg.get("ddp_find_unused_parameters", False),
+        report_to="tensorboard",
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=Dataset.from_list(train_entries),
+        eval_dataset=Dataset.from_list(val_entries),
+        data_collator=collator,
+    )
+
+    trainer.train()
+    trainer.save_model()
+    print(f"\nTraining complete. LoRA adapter saved to: {train_cfg['output_dir']}")
+
+
+if __name__ == "__main__":
+    main()

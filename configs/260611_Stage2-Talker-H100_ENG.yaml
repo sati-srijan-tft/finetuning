@@ -1,0 +1,53 @@
+### Stage 2: Talker Fine-Tuning — H100 80 GB (HuggingFace, no NeMo)
+### Thinker is frozen in 8-bit (≈30 GB) — better quality than 4-bit while still
+### leaving ~50 GB headroom for Talker activations, LoRA, and optimizer states.
+### Uses the Stage 1 merged HF checkpoint directly; NeMo conversion not needed.
+
+### Input model — Stage 1 merged HF checkpoint (output of 04_merge_lora_adapters.sh)
+model_path: "./LLaMA-Factory/outputs/stage1_merged"
+
+### Frozen Thinker quantization
+### H100 80 GB: switch to 8-bit (load_in_8bit) for better numerical quality.
+### If you see OOM, fall back to the 4-bit settings from talker_finetune_bnb.yaml.
+quantization:
+  load_in_8bit: true              # ~30 GB — 2× the 4-bit size but noticeably better quality
+  llm_int8_threshold: 6.0         # outlier threshold for LLM.int8(); default is fine
+  llm_int8_has_fp16_weight: false
+
+### LoRA — applied only to Talker submodule linear layers; Thinker stays frozen
+lora:
+  rank: 16                        # doubled vs BnB config — H100 headroom allows a larger adapter
+  alpha: 32
+  dropout: 0.05
+  talker_module_regex: ".*talker.*\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+
+### HuggingFace Trainer hyperparameters
+training:
+  output_dir: "./outputs/stage2_talker_h100"
+  num_train_epochs: 5
+  per_device_train_batch_size: 8   # H100: 4× the BnB batch; reduce to 4 if OOM
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4   # effective batch = 8 × 4 = 32 (same as BnB config)
+  learning_rate: 1.0e-4
+  lr_scheduler_type: cosine
+  warmup_steps: 200
+  bf16: true
+  tf32: true                       # Hopper TF32 for matmuls — free throughput gain
+  gradient_checkpointing: false    # not needed on H100; disabling recovers ~30% compute
+  optim: adamw_torch_fused         # fused CUDA kernel, ~15% faster optimizer step
+  flash_attn: fa2                  # enable FA2 on Talker attention layers
+  logging_steps: 10
+  save_steps: 500
+  load_best_model_at_end: true
+  metric_for_best_model: eval_loss
+  dataloader_num_workers: 8        # H100 hosts have many CPU cores; 4 was A100-conservative
+  dataloader_pin_memory: true
+  ddp_find_unused_parameters: false
+
+### Audio data — same manifest format from 06_prepare_stage2_manifest.py
+data:
+  train_manifest: "/path/to/train_manifest.json"
+  val_manifest: "/path/to/val_manifest.json"
+  sample_rate: 24000               # must match Qwen Omni native rate
+  max_duration: 30.0
+  min_duration: 0.5
