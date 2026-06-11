@@ -49,12 +49,16 @@ def process_split(
     split_name: str,
     output_dir: Path,
     target_sr: int,
+    max_samples: int | None = None,
 ) -> list[dict]:
     wav_dir = output_dir / split_name
     wav_dir.mkdir(parents=True, exist_ok=True)
 
     entries = []
     skipped = 0
+
+    if max_samples is not None:
+        ds_split = ds_split.select(range(min(max_samples, len(ds_split))))
 
     for idx, example in enumerate(ds_split):
         text = (example.get("text") or example.get("sentence") or "").strip()
@@ -115,6 +119,7 @@ def main():
     parser.add_argument("--target_sr", type=int, default=TARGET_SR, help="Target sample rate in Hz")
     parser.add_argument("--split_eval", action="store_true", help="Carve out a validation split from train")
     parser.add_argument("--eval_ratio", type=float, default=0.05, help="Fraction reserved for validation")
+    parser.add_argument("--max_samples", type=int, default=None, help="Cap total examples processed per split (useful for dry-runs)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -136,7 +141,7 @@ def main():
     # Process every available split — we merge then re-split ourselves
     for split_name, split_ds in dataset.items():
         print(f"\nProcessing split '{split_name}' ({len(split_ds)} examples)…")
-        entries = process_split(split_ds, split_name, output_dir, args.target_sr)
+        entries = process_split(split_ds, split_name, output_dir, args.target_sr, args.max_samples)
         all_entries.extend(entries)
 
     if not all_entries:

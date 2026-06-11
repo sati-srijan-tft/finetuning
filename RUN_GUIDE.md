@@ -174,6 +174,13 @@ python scripts/00_prepare_indicTTS_hindi.py \
     --manifest_dir ./manifests \
     --split_eval \
     --eval_ratio 0.05
+
+# Dry-run / smoke-test with a small subset (100 examples per split):
+python scripts/00_prepare_indicTTS_hindi.py \
+    --output_dir /data/indictts_hindi \
+    --manifest_dir ./manifests \
+    --split_eval \
+    --max_samples 100
 ```
 
 If the dataset is gated, authenticate first:
