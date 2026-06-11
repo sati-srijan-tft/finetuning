@@ -93,7 +93,7 @@ cd /workspace/finetuning
 bash scripts/01_setup_stage1.sh
 pip install datasets soundfile librosa   # extra deps for IndicVoices
 
-pip install torchcodec  #the newer version uses this instead of soundfile and librosa
+pip install torchcodec --index-url https://download.pytorch.org/whl/cu128  #the newer version uses this instead of soundfile and librosa (for cuda 12.8)
 ```
 
 ### Step 4 — Prepare data (with IndicVoices ASR)

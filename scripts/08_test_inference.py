@@ -28,9 +28,26 @@ def build_chat_prompt(tokenizer, user_message: str, system_message: str) -> str:
     )
 
 
+def _resolve_model_class(model_path: str):
+    """Return the right CausalLM class for this checkpoint."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    model_type = getattr(config, "model_type", "")
+    if "omni" in model_type.lower():
+        try:
+            from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+                Qwen3OmniMoeThinkerForCausalLM,
+            )
+            print(f"Detected omni model type '{model_type}' — using Qwen3OmniMoeThinkerForCausalLM")
+            return Qwen3OmniMoeThinkerForCausalLM
+        except ImportError:
+            pass
+    return AutoModelForCausalLM
+
+
 def run_inference(model_path: str, prompt: str, system: str, load_in_4bit: bool, max_new_tokens: int):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import AutoTokenizer, BitsAndBytesConfig
 
     print(f"Loading tokenizer from {model_path} ...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -39,7 +56,7 @@ def run_inference(model_path: str, prompt: str, system: str, load_in_4bit: bool,
     if load_in_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,  # A100: bfloat16 > float16 (wider range, no inf)
+            bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
         )
@@ -47,11 +64,12 @@ def run_inference(model_path: str, prompt: str, system: str, load_in_4bit: bool,
     else:
         print("Loading model in bfloat16 (A100 native) ...")
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class = _resolve_model_class(model_path)
+    model = model_class.from_pretrained(
         model_path,
         device_map="auto",
-        torch_dtype=torch.bfloat16,          # A100 has hardware BF16 — faster and more stable than FP16
-        attn_implementation="flash_attention_2",  # Flash Attention 2: ~3x faster, requires flash-attn package
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
         quantization_config=quantization_config,
         trust_remote_code=True,
     )
