@@ -18,13 +18,14 @@ finetuning/
 │   ├── talker_finetune_bnb.yaml             # Stage 2: BitsAndBytes HF path (no NeMo)
 │   └── talker_finetune_quantized_thinker.yaml # Stage 2: NeMo + quantized frozen Thinker
 ├── scripts/
+│   ├── 00_prepare_indicTTS_hindi.py # Download SPRINGLab/IndicTTS-Hindi + build NeMo manifests
 │   ├── 01_setup_stage1.sh           # Install LLaMA-Factory on GPU instance
 │   ├── 02_prepare_stage1_data.py    # Validate & copy data to LLaMA-Factory
 │   ├── 03_run_stage1_training.sh    # Run Stage 1 LoRA training
 │   ├── 04_merge_lora_adapters.sh    # Merge LoRA into base model
 │   ├── fix_data_jsonl.py            # One-shot fix: normalize array content → string format
 │   ├── 05_convert_to_nemo.sh        # Convert HF → .nemo for Stage 2
-│   ├── 06_prepare_stage2_manifest.py# Resample audio + build NeMo manifests
+│   ├── 06_prepare_stage2_manifest.py# Resample audio + build NeMo manifests (generic)
 │   ├── 07_run_stage2_training.sh    # Run Stage 2 NeMo TTS training
 │   └── 08_test_inference.py         # Verify Stage 1 model responds in Hindi
 └── outputs/                    # Created automatically during training
@@ -154,21 +155,36 @@ python scripts/08_test_inference.py \
 
 ### Step 1 — Prepare audio data
 
+**Recommended: SPRINGLab/IndicTTS-Hindi (HuggingFace)**
+
+This single command downloads the dataset, resamples to 24 kHz, saves `.wav` files, and writes NeMo manifests:
+```bash
+pip install datasets soundfile librosa numpy
+
+python scripts/00_prepare_indicTTS_hindi.py \
+    --output_dir /data/indictts_hindi \
+    --manifest_dir ./manifests \
+    --split_eval \
+    --eval_ratio 0.05
+```
+
+If the dataset is gated, authenticate first:
+```bash
+huggingface-cli login
+# or pass: --hf_token hf_XXXXXXXXXXXX
+```
+
+**Alternative: bring your own `.wav` + `.txt` pairs**
+
 Layout your audio + transcripts like this:
 ```
 /data/indic_tts/
     hindi/
         clip_001.wav   +   clip_001.txt
         clip_002.wav   +   clip_002.txt
-    tamil/
-        ...
 ```
 
-Recommended audio sources:
-- **IndicTTS** (AI4Bharat) — 13 languages, studio quality
-- **LJSpeech-style** custom recordings
-
-Then generate the NeMo manifests:
+Then generate the NeMo manifests with the generic script:
 ```bash
 python scripts/06_prepare_stage2_manifest.py \
     --audio_dir /data/indic_tts \
