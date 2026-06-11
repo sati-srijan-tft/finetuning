@@ -159,7 +159,6 @@ python scripts/08_test_inference.py \
 
 This single command downloads the dataset, resamples to 24 kHz, saves `.wav` files, and writes NeMo manifests:
 ```bash
-pip install datasets soundfile librosa numpy
 
 python scripts/00_prepare_indicTTS_hindi.py \
     --output_dir /data/indictts_hindi \
