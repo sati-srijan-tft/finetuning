@@ -30,18 +30,41 @@ def build_chat_prompt(tokenizer, user_message: str, system_message: str) -> str:
 
 def _resolve_model_class(model_path: str):
     """Return the right CausalLM class for this checkpoint."""
+    import importlib
     from transformers import AutoConfig, AutoModelForCausalLM
+
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model_type = getattr(config, "model_type", "")
-    if "omni" in model_type.lower():
+    config_class = type(config).__name__
+
+    if "omni" in model_type.lower() or "Qwen3OmniMoe" in config_class:
+        module_name = "transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe"
+        candidates = [
+            "Qwen3OmniMoeThinkerForConditionalGeneration",
+            "Qwen3OmniMoeThinkerForCausalLM",
+            "Qwen3OmniThinkerForCausalLM",
+        ]
         try:
-            from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-                Qwen3OmniMoeThinkerForCausalLM,
-            )
-            print(f"Detected omni model type '{model_type}' — using Qwen3OmniMoeThinkerForCausalLM")
-            return Qwen3OmniMoeThinkerForCausalLM
-        except ImportError:
-            pass
+            mod = importlib.import_module(module_name)
+        except ImportError as e:
+            raise RuntimeError(
+                f"Config '{config_class}' (model_type='{model_type}') requires the "
+                f"Qwen3OmniMoe modeling module but it could not be imported: {e}\n"
+                f"Try: pip install --upgrade transformers"
+            ) from e
+
+        for class_name in candidates:
+            cls = getattr(mod, class_name, None)
+            if cls is not None:
+                print(f"Detected omni model type '{model_type}' — using {class_name}")
+                return cls
+
+        raise RuntimeError(
+            f"Config '{config_class}' (model_type='{model_type}') looks like a Qwen3-Omni "
+            f"model but none of the expected classes {candidates} were found in {module_name}. "
+            f"Try: pip install --upgrade transformers"
+        )
+
     return AutoModelForCausalLM
 
 
@@ -68,7 +91,7 @@ def run_inference(model_path: str, prompt: str, system: str, load_in_4bit: bool,
     model = model_class.from_pretrained(
         model_path,
         device_map="auto",
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         quantization_config=quantization_config,
         trust_remote_code=True,
