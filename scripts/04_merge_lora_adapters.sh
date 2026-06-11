@@ -26,7 +26,7 @@ fi
 llamafactory-cli export \
     --model_name_or_path "$MODEL_PATH" \
     --adapter_name_or_path "$ADAPTER_PATH" \
-    --template qwen \
+    --template qwen3_omni_nothink \
     --finetuning_type lora \
     --export_dir "$MERGED_PATH" \
     --export_size 4 \
