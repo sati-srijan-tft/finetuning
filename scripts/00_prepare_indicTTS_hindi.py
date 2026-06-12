@@ -85,6 +85,7 @@ def process_split(
         speaker = str(example.get("speaker_id") or example.get("speaker") or "spk")
         wav_name = f"{speaker}_{idx:06d}.wav"
         wav_path = wav_dir / wav_name
+        wav_path = f"./{wav_path}"
 
         sf.write(str(wav_path), resampled, target_sr, subtype="PCM_16")
 

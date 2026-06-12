@@ -46,7 +46,7 @@ training:
 
 ### Audio data — same manifest format from 06_prepare_stage2_manifest.py
 data:
-  train_manifest: "/path/to/train_manifest.json"
+  train_manifest: "./manifests/train_manifest.json"
   val_manifest: "/path/to/val_manifest.json"
   sample_rate: 24000               # must match Qwen Omni native rate
   max_duration: 30.0
