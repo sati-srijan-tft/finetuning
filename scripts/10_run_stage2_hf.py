@@ -25,7 +25,7 @@ from typing import Dict, List
 import torch
 import yaml
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
     AutoProcessor,
     BitsAndBytesConfig,
@@ -257,7 +257,7 @@ def main():
             sys.exit(1)
 
     peft_config = LoraConfig(
-        task_type=None,  # outer model is not a standard causal LM; use bare PeftModel
+        task_type=TaskType.CAUSAL_LM,  # thinker is a causal LM; PEFT wrapper exposes 'labels' for eval
         r=lora_cfg["rank"],
         lora_alpha=lora_cfg["alpha"],
         lora_dropout=lora_cfg["dropout"],
