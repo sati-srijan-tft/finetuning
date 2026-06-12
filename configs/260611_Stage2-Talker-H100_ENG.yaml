@@ -14,12 +14,16 @@ quantization:
   llm_int8_threshold: 6.0         # outlier threshold for LLM.int8(); default is fine
   llm_int8_has_fp16_weight: false
 
-### LoRA — applied only to Talker submodule linear layers; Thinker stays frozen
+### LoRA — applied to Thinker attention layers (model.layers.*.self_attn)
+### Qwen3OmniMoeThinkerForConditionalGeneration has no "talker" submodule; all
+### trainable linears live under model.layers.*.self_attn.
+### The MoE experts (model.layers.*.mlp.experts) do NOT expose gate_proj /
+### up_proj / down_proj as individually named modules, so they are excluded.
 lora:
   rank: 16                        # doubled vs BnB config — H100 headroom allows a larger adapter
   alpha: 32
   dropout: 0.05
-  talker_module_regex: ".*talker.*\\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
+  target_modules_regex: "model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)"
 
 ### HuggingFace Trainer hyperparameters
 training:
