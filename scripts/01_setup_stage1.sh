@@ -12,9 +12,12 @@ sudo apt-get update -q && sudo apt-get install -y -q git wget ffmpeg libsndfile1
 # --- System dependancies for torchcodec --- 
 sudo apt-get install -y libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev
 
+# --- install python --- 
+sudo apt install python3.12-venv
+
 # --- Python environment ---
 if command -v conda &>/dev/null; then
-    conda create -n llama_factory python=3.11 -y
+    conda create -n llama_factory python=3.12 -y
     conda activate llama_factory
 else
     python3 -m venv .venv

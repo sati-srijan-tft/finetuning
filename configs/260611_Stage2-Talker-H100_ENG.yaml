@@ -20,10 +20,8 @@
 ###            p.requires_grad = n.startswith('talker.')
 
 ### Base weights — original HF checkpoint (Talker weights come from here)
-model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
-
-### Stage 1 Thinker override — injected on top of the base model at load time
-thinker_override_path: "./LLaMA-Factory/outputs/stage1_merged"
+model_name_or_path: "./qwen3-omni-full-merged"
+model_path: "Qwen/Qwen3-Omni-30B-A3B-Thinking"
 
 ### Frozen Thinker quantization (applied to model.layers.* only)
 quantization:

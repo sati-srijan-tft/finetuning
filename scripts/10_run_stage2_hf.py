@@ -36,9 +36,8 @@ from transformers import (
 # Qwen3OmniMoeThinker is not registered with AutoModelForCausalLM in transformers;
 # import it directly from the submodule.
 try:
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        Qwen3OmniMoeThinkerForConditionalGeneration as _ModelCls,
-    )
+    from transformers import Qwen3OmniMoeForConditionalGeneration as _ModelCls
+    
 except ImportError:
     # Fallback: older or patched transformers may expose it via AutoModel
     from transformers import AutoModel as _ModelCls
@@ -189,12 +188,13 @@ def main():
 
     print(f"\n=== Stage 2 Talker fine-tuning (HuggingFace) ===")
     print(f"Config : {args.config}")
-    print(f"Model  : {cfg['model_path']}")
+    print(f"Base_Model  : {cfg['model_path']}")
+    print(f"Finetuned_Model  : {cfg['model_name_or_path']}")
 
     # --- Model ---
     bnb_config = build_bnb_config(quant_cfg) if quant_cfg else None
     model = _ModelCls.from_pretrained(
-        cfg["model_path"],
+        cfg["model_name_or_path"],
         quantization_config=bnb_config,
         torch_dtype=torch.bfloat16,
         device_map="auto",
@@ -207,7 +207,7 @@ def main():
         param.requires_grad = False
 
     # --- LoRA ---
-    target_modules = find_talker_targets(model, lora_cfg["talker_module_regex"])
+    target_modules = find_talker_targets(model, lora_cfg["target_modules_regex"])
     if not target_modules:
         sys.exit(1)
 
@@ -253,7 +253,7 @@ def main():
         optim=train_cfg.get("optim", "adamw_torch_fused"),
         logging_steps=train_cfg.get("logging_steps", 10),
         save_steps=train_cfg.get("save_steps", 500),
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=train_cfg.get("save_steps", 500),
         load_best_model_at_end=train_cfg.get("load_best_model_at_end", True),
         metric_for_best_model=train_cfg.get("metric_for_best_model", "eval_loss"),
@@ -261,6 +261,7 @@ def main():
         dataloader_pin_memory=train_cfg.get("dataloader_pin_memory", True),
         ddp_find_unused_parameters=train_cfg.get("ddp_find_unused_parameters", False),
         report_to="tensorboard",
+        remove_unused_columns=False,
     )
 
     trainer = Trainer(
