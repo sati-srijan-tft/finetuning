@@ -1,57 +1,79 @@
 ### Stage 2: Talker Fine-Tuning — H100 80 GB (HuggingFace, no NeMo)
-### Thinker is frozen in 8-bit (≈30 GB) — better quality than 4-bit while still
-### leaving ~50 GB headroom for Talker activations, LoRA, and optimizer states.
-### Uses the Stage 1 merged HF checkpoint directly; NeMo conversion not needed.
+### Thinker (model.layers.{0..47}, MoE, 30B active params) is frozen in 8-bit.
+### Only Talker layers receive LoRA updates.
+###
+### IMPORTANT — two-step loading required (stage1_merged has NO Talker weights):
+###   1. Load full model from 'Qwen/Qwen3-Omni-30B-A3B-Instruct':
+###        from transformers import Qwen3OmniMoeForConditionalGeneration
+###        full_model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+###            model_name_or_path,
+###            torch_dtype=torch.bfloat16,
+###            device_map="auto",
+###            attn_implementation="flash_attention_2",
+###        )
+###   2. Inject Stage 1 Thinker weights:
+###        stage1 = torch.load('stage1_merged/pytorch_model*.bin')
+###        full_model.load_state_dict(stage1, strict=False)
+###      strict=False leaves Talker + code2wav weights from step 1 intact.
+###   3. Freeze everything except talker.*:
+###        for n, p in full_model.named_parameters():
+###            p.requires_grad = n.startswith('talker.')
 
-### Input model — Stage 1 merged HF checkpoint (output of 04_merge_lora_adapters.sh)
-model_path: "./LLaMA-Factory/outputs/stage1_merged"
+### Base weights — original HF checkpoint (Talker weights come from here)
+model_name_or_path: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
-### Frozen Thinker quantization
-### H100 80 GB: switch to 8-bit (load_in_8bit) for better numerical quality.
-### If you see OOM, fall back to the 4-bit settings from talker_finetune_bnb.yaml.
+### Stage 1 Thinker override — injected on top of the base model at load time
+thinker_override_path: "./LLaMA-Factory/outputs/stage1_merged"
+
+### Frozen Thinker quantization (applied to model.layers.* only)
 quantization:
-  load_in_8bit: true              # ~30 GB — 2× the 4-bit size but noticeably better quality
-  llm_int8_threshold: 6.0         # outlier threshold for LLM.int8(); default is fine
+  load_in_8bit: true              # ~30 GB — better quality than 4-bit
+  llm_int8_threshold: 6.0
   llm_int8_has_fp16_weight: false
 
-### LoRA — applied to Thinker attention layers (model.layers.*.self_attn)
-### Qwen3OmniMoeThinkerForConditionalGeneration has no "talker" submodule; all
-### trainable linears live under model.layers.*.self_attn.
-### The MoE experts (model.layers.*.mlp.experts) do NOT expose gate_proj /
-### up_proj / down_proj as individually named modules, so they are excluded.
+### LoRA — Talker only; Thinker and code2wav stay frozen
+###
+### Module map (confirmed from LOAD REPORT on Qwen/Qwen3-Omni-30B-A3B-Instruct):
+###   talker.model.layers.{0..19}          — 20-layer MoE decoder (main Talker)
+###   talker.code_predictor.model.layers.{0..4} — 5-layer dense predictor
+###   code2wav.*                            — vocoder; keep frozen (not fine-tuned here)
+###
+### Regex covers both Talker attention stacks. Add code_predictor MLP targets
+### (gate_proj|up_proj|down_proj) if VRAM budget allows after profiling.
 lora:
-  rank: 16                        # doubled vs BnB config — H100 headroom allows a larger adapter
+  rank: 16
   alpha: 32
   dropout: 0.05
-  target_modules_regex: "model\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)"
+  target_modules_regex: "talker\\.(model|code_predictor\\.model)\\.layers\\.\\d+\\.self_attn\\.(q_proj|k_proj|v_proj|o_proj)"
 
 ### HuggingFace Trainer hyperparameters
+### NOTE: flash_attn must be set in model_kwargs (attn_implementation="flash_attention_2"),
+###       not here — TrainingArguments has no flash_attn field.
 training:
   output_dir: "./outputs/stage2_talker_h100"
   num_train_epochs: 5
-  per_device_train_batch_size: 8   # H100: 4× the BnB batch; reduce to 4 if OOM
+  per_device_train_batch_size: 8   # reduce to 4 if OOM
   per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 4   # effective batch = 8 × 4 = 32 (same as BnB config)
+  gradient_accumulation_steps: 4   # effective batch = 32
   learning_rate: 1.0e-4
   lr_scheduler_type: cosine
   warmup_steps: 200
   bf16: true
-  tf32: true                       # Hopper TF32 for matmuls — free throughput gain
-  gradient_checkpointing: false    # not needed on H100; disabling recovers ~30% compute
-  optim: adamw_torch_fused         # fused CUDA kernel, ~15% faster optimizer step
-  flash_attn: fa2                  # enable FA2 on Talker attention layers
+  tf32: true                       # Hopper TF32 — free throughput
+  gradient_checkpointing: false    # H100: disable for ~30% compute gain
+  optim: adamw_torch_fused
   logging_steps: 10
   save_steps: 500
   load_best_model_at_end: true
   metric_for_best_model: eval_loss
-  dataloader_num_workers: 8        # H100 hosts have many CPU cores; 4 was A100-conservative
+  dataloader_num_workers: 8
   dataloader_pin_memory: true
   ddp_find_unused_parameters: false
 
-### Audio data — same manifest format from 06_prepare_stage2_manifest.py
+### Audio data — TTS manifests for Talker training
 data:
   train_manifest: "./manifests/train_manifest.json"
-  val_manifest: "/path/to/val_manifest.json"
+  val_manifest: "./manifests/val_manifest.json"
   sample_rate: 24000               # must match Qwen Omni native rate
   max_duration: 30.0
   min_duration: 0.5
