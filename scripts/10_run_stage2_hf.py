@@ -27,12 +27,21 @@ import yaml
 from datasets import Dataset
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
-    AutoModelForCausalLM,
     AutoProcessor,
     BitsAndBytesConfig,
     Trainer,
     TrainingArguments,
 )
+
+# Qwen3OmniMoeThinker is not registered with AutoModelForCausalLM in transformers;
+# import it directly from the submodule.
+try:
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeThinkerForConditionalGeneration as _ModelCls,
+    )
+except ImportError:
+    # Fallback: older or patched transformers may expose it via AutoModel
+    from transformers import AutoModel as _ModelCls
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +85,8 @@ def find_talker_targets(model, regex: str) -> List[str]:
             f"\nWARNING: talker_module_regex '{regex}' matched no modules.\n"
             "Inspect the model to find the right prefix:\n\n"
             f"  python -c \"\n"
-            f"  from transformers import AutoModelForCausalLM\n"
-            f"  m = AutoModelForCausalLM.from_pretrained('{model.config._name_or_path}', "
-            f"trust_remote_code=True)\n"
+            f"  from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerForConditionalGeneration\n"
+            f"  m = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained('{model.config._name_or_path}')\n"
             f"  print([n for n,_ in m.named_modules()])\n"
             f"  \"\n\n"
             "Then update talker_module_regex in your config and re-run.\n"
@@ -185,7 +193,7 @@ def main():
 
     # --- Model ---
     bnb_config = build_bnb_config(quant_cfg) if quant_cfg else None
-    model = AutoModelForCausalLM.from_pretrained(
+    model = _ModelCls.from_pretrained(
         cfg["model_path"],
         quantization_config=bnb_config,
         torch_dtype=torch.bfloat16,
