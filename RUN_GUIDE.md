@@ -211,7 +211,7 @@ python scripts/06_prepare_stage2_manifest.py \
 ### Step 2 — Install HF dependencies
 
 ```bash
-pip install transformers peft bitsandbytes accelerate soundfile
+pip install transformers peft bitsandbytes accelerate soundfile tensorboard
 # Only needed if your audio is not already at 24 kHz:
 pip install librosa
 ```
@@ -256,7 +256,7 @@ python scripts/11_merge_stage2_lora.py
 
 # Explicit paths
 python scripts/11_merge_stage2_lora.py \
-    --base_model  ./LLaMA-Factory/outputs/stage1_merged \
+    --base_model  ./qwen3-omni-full-merged \
     --adapter     ./outputs/stage2_talker_h100 \
     --output_dir  ./outputs/final_model
 ```
