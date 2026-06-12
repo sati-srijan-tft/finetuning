@@ -270,6 +270,7 @@ def main():
         train_dataset=Dataset.from_list(train_entries),
         eval_dataset=Dataset.from_list(val_entries),
         data_collator=collator,
+        processing_class= processor
     )
 
     trainer.train()

@@ -141,8 +141,7 @@ Monitor training loss at `outputs/stage1_lora/trainer_log.jsonl`.
 ### Step 6 — Merge LoRA adapters
 
 ```bash
-cd LLaMA-Factory
-bash ../scripts/04_merge_lora_adapters.sh
+python model_merge_into_base_model.py
 ```
 
 ### Step 7 — Test the model
