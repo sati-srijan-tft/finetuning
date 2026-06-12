@@ -307,6 +307,7 @@ def main():
         ddp_find_unused_parameters=train_cfg.get("ddp_find_unused_parameters", False),
         report_to="tensorboard",
         remove_unused_columns=False,
+        label_names=["labels"],  # PEFT wrappers don't expose 'labels' in forward signature inspection
     )
 
     trainer = Trainer(
