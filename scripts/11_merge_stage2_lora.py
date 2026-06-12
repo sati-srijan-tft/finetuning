@@ -24,14 +24,19 @@ from pathlib import Path
 
 import torch
 from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoProcessor
+
+try:
+    from transformers import Qwen3OmniMoeForConditionalGeneration as _ModelCls
+except ImportError:
+    from transformers import AutoModel as _ModelCls
 
 
 CANDIDATE_ADAPTERS = [
     "./outputs/stage2_talker_h100",
     "./outputs/stage2_talker_bnb",
 ]
-DEFAULT_BASE = "./LLaMA-Factory/outputs/stage1_merged"
+DEFAULT_BASE = "./qwen3-omni-full-merged"
 DEFAULT_OUTPUT = "./outputs/final_model"
 
 
@@ -88,7 +93,7 @@ def main():
 
     # --- Load base model in full precision (no quantization during merge) ---
     print("Loading base model (this may take a few minutes)...")
-    model = AutoModelForCausalLM.from_pretrained(
+    model = _ModelCls.from_pretrained(
         base_path,
         torch_dtype=dtype,
         device_map="cpu",      # merge on CPU to avoid VRAM limits
@@ -99,7 +104,8 @@ def main():
 
     # --- Load processor / tokenizer from base ---
     print("Loading processor...")
-    processor = AutoProcessor.from_pretrained(base_path, trust_remote_code=True)
+    processor_config_from_hf = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    processor = AutoProcessor.from_pretrained(processor_config_from_hf, trust_remote_code=True)
 
     # --- Apply Stage 2 LoRA adapter and merge ---
     print("Applying Stage 2 LoRA adapter...")
