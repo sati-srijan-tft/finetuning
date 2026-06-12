@@ -7,7 +7,7 @@ set -e
 echo "=== Stage 1 Setup: LLaMA-Factory for Qwen 3 Omni Thinker ==="
 
 # --- System dependencies ---
-apt-get update -q && apt-get install -y -q git wget ffmpeg libsndfile1
+sudo apt-get update -q && sudo apt-get install -y -q git wget ffmpeg libsndfile1
 
 # --- System dependancies for torchcodec --- 
 sudo apt-get install -y libavformat-dev libavcodec-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev libavfilter-dev
