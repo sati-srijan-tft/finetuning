@@ -25,7 +25,7 @@ from typing import Dict, List
 import torch
 import yaml
 from datasets import Dataset
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoProcessor,
     BitsAndBytesConfig,
@@ -202,17 +202,62 @@ def main():
     )
     processor = AutoProcessor.from_pretrained(cfg["model_path"], trust_remote_code=True)
 
+    # ---------------------------------------------------------------------------
+    # Qwen3OmniMoeForConditionalGeneration is a generation-only wrapper: it has
+    # no forward() method, so PEFT's BaseTuner.forward() hits PyTorch's default
+    # _forward_unimplemented. Patch the class to delegate to model.thinker.
+    #
+    # LIMITATION: this routes the training loss through the Thinker (text LM),
+    # not the Talker (audio codec decoder). For full Talker training you need:
+    #   1. Audio codec tokenization in TalkerDataCollator (wav → RVQ codes)
+    #   2. A forward that runs thinker → hidden_projection → talker
+    #   3. Cross-entropy loss over the 15 codec-codebook predictions
+    # ---------------------------------------------------------------------------
+    if not any('forward' in cls.__dict__
+               for cls in type(model).__mro__
+               if cls is not torch.nn.Module):
+        thinker_sub = getattr(model, 'thinker', None)
+        if thinker_sub is None:
+            raise RuntimeError(
+                f"{type(model).__name__} has no forward() and no .thinker submodule; "
+                "cannot train. Check your transformers version."
+            )
+        def _patched_forward(self, *args, **kwargs):
+            return self.thinker(*args, **kwargs)
+        type(model).forward = _patched_forward
+        print(f"  Patched {type(model).__name__}.forward → thinker "
+              "(text-loss proxy; see script comment for full Talker training)")
+
     # Freeze everything; PEFT will unfreeze adapter params
     for param in model.parameters():
         param.requires_grad = False
 
     # --- LoRA ---
-    target_modules = find_talker_targets(model, lora_cfg["target_modules_regex"])
+    # Try the configured regex first (talker layers). If nothing matches the
+    # thinker forward path, fall back to thinker attention layers so LoRA
+    # adapters actually receive gradients.
+    regex = lora_cfg["target_modules_regex"]
+    target_modules = find_talker_targets(model, regex)
     if not target_modules:
         sys.exit(1)
 
+    # Warn when all matched modules live under talker.* (outside forward path)
+    all_matched = [n for n, _ in model.named_modules() if re.fullmatch(regex, n)]
+    if all_matched and all(n.startswith('talker.') for n in all_matched):
+        fallback_regex = r"thinker\.model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
+        print(
+            "\nWARNING: All LoRA targets are in talker.* but the forward path goes through "
+            "thinker — those adapters will receive no gradients.\n"
+            f"  Falling back to thinker attention layers: {fallback_regex}\n"
+            "  To train the Talker, implement audio codec tokenization and a proper "
+            "thinker→talker forward (see script comment above).\n"
+        )
+        target_modules = find_talker_targets(model, fallback_regex)
+        if not target_modules:
+            sys.exit(1)
+
     peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
+        task_type=None,  # outer model is not a standard causal LM; use bare PeftModel
         r=lora_cfg["rank"],
         lora_alpha=lora_cfg["alpha"],
         lora_dropout=lora_cfg["dropout"],
