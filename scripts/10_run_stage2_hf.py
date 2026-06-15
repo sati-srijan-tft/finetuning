@@ -35,6 +35,7 @@ from transformers import (
     BitsAndBytesConfig,
     Trainer,
     TrainingArguments,
+    Qwen3OmniMoeProcessor,
 )
 
 # Qwen3OmniMoeThinker is not registered with AutoModelForCausalLM in transformers;
@@ -278,21 +279,51 @@ class TalkerDataCollatorPatched:
         )
 
         # 3. Extract the discrete target RVQ codes from the raw audios.
-        # We wrap this in torch.no_grad() because we don't want to backprop through the audio tokenizer.
+        # NOTE: this must run in the main process (dataloader_num_workers=0) because
+        # self.model lives on the GPU and is not accessible from DataLoader subprocesses.
         with torch.no_grad():
-            # Depending on the exact Qwen-Omni HF implementation class, the quantization method 
-            # might be called 'encode_audio', 'quantize', or live inside a sub-module like 'model.audio_encoder'.
-            # A highly reliable way for Qwen Omni models is using the model's native audio tokenization pass:
+            audio_codes = None
+
             if hasattr(self.model, "encode_audio"):
-                # Returns tensor of shape: [batch, 15, seq_len]
                 audio_codes = self.model.encode_audio(audios, sampling_rate=self.sample_rate)
+
+            elif (hasattr(self.model, "talker") and
+                  hasattr(self.model.talker, "codec_model")):
+                # Qwen3-Omni: the CosyVoice codec lives inside model.talker.codec_model
+                codec = self.model.talker.codec_model
+                codec_device = next(codec.parameters()).device
+                all_codes = []
+                for waveform in audios:
+                    # codec expects [batch=1, channels=1, time]
+                    wav_t = torch.FloatTensor(waveform).unsqueeze(0).unsqueeze(0).to(codec_device)
+                    result = codec.encode(wav_t)
+                    # result may be (codes, scale) or just codes; codes shape [1, n_cb, T']
+                    codes = result[0] if isinstance(result, (list, tuple)) else result
+                    all_codes.append(codes.squeeze(0))  # [n_cb, T']
+                max_t = max(c.shape[-1] for c in all_codes)
+                n_cb = all_codes[0].shape[0]
+                padded = torch.zeros(len(all_codes), n_cb, max_t, dtype=torch.long, device=codec_device)
+                for i, c in enumerate(all_codes):
+                    padded[i, :, :c.shape[-1]] = c
+                audio_codes = padded
+
             elif hasattr(self.model, "audio_encoder"):
                 audio_features = self.processor.feature_extractor(audios, sampling_rate=self.sample_rate, return_tensors="pt")
                 audio_features = {k: v.to(self.model.device) for k, v in audio_features.items()}
                 audio_codes = self.model.audio_encoder.encode(**audio_features)
+
             else:
-                # Fallback fallback check: see if the processor's initial encoding pass already extracted them
                 audio_codes = encoded.get("audio_codes", None)
+                if audio_codes is None:
+                    codec_related = [
+                        n for n, _ in self.model.named_modules()
+                        if any(k in n.lower() for k in ("codec", "audio", "quantiz", "vq"))
+                    ]
+                    raise ValueError(
+                        "Could not extract 'audio_codes'. Codec-related modules found:\n"
+                        f"  {codec_related[:30]}\n"
+                        "Update the codec encoding path in TalkerDataCollatorPatched."
+                    )
 
         # 4. Set up standard text labels
         labels = encoded["input_ids"].clone()
@@ -345,7 +376,7 @@ def main():
         device_map="auto",
         trust_remote_code=True,
     )
-    processor = AutoProcessor.from_pretrained(cfg["model_path"], trust_remote_code=True)
+    processor = Qwen3OmniMoeProcessor.from_pretrained(cfg["model_path"], trust_remote_code=True)
 
     # Qwen3OmniMoeForConditionalGeneration is a generation-only wrapper with no forward().
     # Patch it to run thinker → talker with cross-entropy loss over all 15 RVQ codebooks.
@@ -417,8 +448,9 @@ def main():
         eval_steps=train_cfg.get("save_steps", 500),
         load_best_model_at_end=train_cfg.get("load_best_model_at_end", True),
         metric_for_best_model=train_cfg.get("metric_for_best_model", "eval_loss"),
-        dataloader_num_workers=train_cfg.get("dataloader_num_workers", 4),
-        dataloader_pin_memory=train_cfg.get("dataloader_pin_memory", True),
+        # TalkerDataCollatorPatched holds a GPU model reference — must stay in main process.
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
         ddp_find_unused_parameters=train_cfg.get("ddp_find_unused_parameters", False),
         report_to="tensorboard",
         remove_unused_columns=False,
