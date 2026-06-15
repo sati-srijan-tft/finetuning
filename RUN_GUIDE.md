@@ -161,26 +161,53 @@ python scripts/08_test_inference.py \
 > scripts for Qwen Omni. The NeMo configs (`talker_finetune*.yaml`) are kept for reference but
 > cannot be used until upstream NeMo adds support. **Use the HuggingFace path below.**
 
+### Architecture notes (learned from inspecting transformers source)
+
+`Qwen3OmniMoeForConditionalGeneration` has **no `forward()` method** — it is generation-only.
+`10_run_stage2_hf.py` monkey-patches one in at startup.
+
+The Talker (`Qwen3OmniMoeTalkerForConditionalGeneration`) has its own separate vocabulary
+(**3 072+ tokens**) and is structured as:
+
+| Component | Role |
+|---|---|
+| `talker.text_projection` | Projects thinker word-embeddings → talker hidden size (1 024) |
+| `talker.hidden_projection` | Projects thinker hidden states for multimodal (audio/image) inputs only |
+| `talker.model.codec_embedding` | Embeds codec token IDs → talker hidden size |
+| `talker.codec_head` | Linear head — predicts **first codebook** tokens (the "main" acoustic stream) |
+| `talker.code_predictor` | Predicts **residual codebooks 2–32** (used at inference; not trained here) |
+
+Training targets the first codebook only via `codec_head`.  
+**`num_code_groups = 32`** — not 15 as an earlier draft assumed.
+
+**Critical constraint:** The Qwen3-Omni model contains **no audio encoder**.
+`Code2Wav` inside the model is a decoder (codes → waveform) only.
+Converting training audio into codec token IDs requires the **CosyVoice2 speech tokenizer**
+loaded as an external dependency (see Step 2 below).
+
+The data collator holds a reference to this codec model on GPU, so
+**`dataloader_num_workers` is hard-coded to 0** in `10_run_stage2_hf.py` to keep
+everything in the main process.
+
+---
+
 ### Step 1 — Prepare audio data
 
 **Recommended: SPRINGLab/IndicTTS-Hindi (HuggingFace)**
 
-This single command downloads the dataset, resamples to 24 kHz, saves `.wav` files, and writes NeMo manifests:
 ```bash
-
 python scripts/00_prepare_indicTTS_hindi.py \
     --output_dir ./data/indictts_hindi \
     --manifest_dir ./manifests \
     --split_eval \
     --eval_ratio 0.05
 
-# Dry-run / smoke-test with a small subset (100 examples per split):
+# Smoke-test with a small subset:
 python scripts/00_prepare_indicTTS_hindi.py \
     --output_dir ./data/indictts_hindi \
     --manifest_dir ./manifests \
     --max_samples 100 \
     --split_eval
-    
 ```
 
 If the dataset is gated, authenticate first:
@@ -191,7 +218,6 @@ huggingface-cli login
 
 **Alternative: bring your own `.wav` + `.txt` pairs**
 
-Layout your audio + transcripts like this:
 ```
 /data/indic_tts/
     hindi/
@@ -199,7 +225,6 @@ Layout your audio + transcripts like this:
         clip_002.wav   +   clip_002.txt
 ```
 
-Then generate the NeMo manifests with the generic script:
 ```bash
 python scripts/06_prepare_stage2_manifest.py \
     --audio_dir /data/indic_tts \
@@ -208,13 +233,30 @@ python scripts/06_prepare_stage2_manifest.py \
     --split_eval
 ```
 
-### Step 2 — Install HF dependencies
+---
+
+### Step 2 — Install dependencies (including CosyVoice2)
 
 ```bash
 pip install transformers peft bitsandbytes accelerate soundfile tensorboard
-# Only needed if your audio is not already at 24 kHz:
-pip install librosa
+pip install librosa   # needed if audio is not already at 24 kHz
+
+# CosyVoice2 speech tokenizer — required to encode training audio into codec token IDs
+pip install git+https://github.com/FunAudioLLM/CosyVoice.git
+# Then download the tokenizer weights:
+huggingface-cli download FunAudioLLM/CosyVoice2-0.5B --local-dir ./cosyvoice2-0.5b
 ```
+
+> **Why CosyVoice2?**  The Talker is trained to predict discrete codec tokens (first of 32
+> codebooks). Those tokens come from CosyVoice2's speech tokenizer — there is no equivalent
+> encoder anywhere inside `Qwen3-Omni`.  The collator calls it at runtime to encode each
+> `.wav` into target token IDs.
+
+Wire up the codec in `TalkerDataCollatorPatched.__init__` by loading CosyVoice2 and passing
+it as `codec_model` (the collator currently auto-discovers it; if discovery fails it prints
+the talker's child modules and exits cleanly with a message).
+
+---
 
 ### Step 3 — Choose a config and set the paths
 
@@ -223,10 +265,17 @@ pip install librosa
 | `260611_Stage2-Talker-H100_ENG.yaml` | H100 80 GB | 8-bit (~30 GB) | `--hf_h100` |
 | `talker_finetune_bnb.yaml` | Any 24 GB GPU | 4-bit NF4 (~15 GB) | `--hf` |
 
-In your chosen config, update the three placeholder paths:
-- `model_path` → `./LLaMA-Factory/outputs/stage1_merged`
+In your chosen config, update these paths:
+- `model_path` → base model for the processor (e.g. `Qwen/Qwen3-Omni-30B-A3B-Thinking`)
+- `model_name_or_path` → Stage 1 merged model (e.g. `./qwen3-omni-full-merged`)
 - `data.train_manifest` → `./manifests/train_manifest.json`
 - `data.val_manifest` → `./manifests/val_manifest.json`
+
+LoRA currently targets the **Thinker's attention projections** (`q_proj`, `k_proj`, `v_proj`,
+`o_proj`) — 100 modules, ~22 M trainable parameters out of 35 B total (0.06 %).
+Update `lora.target_modules_regex` in the config if you want to target different layers.
+
+---
 
 ### Step 4 — Run Stage 2 training
 
@@ -236,19 +285,23 @@ bash scripts/07_run_stage2_training.sh --hf_h100
 
 # 24 GB GPU
 bash scripts/07_run_stage2_training.sh --hf
-
-# Explicit config override (auto-detects HF vs NeMo from the file)
-bash scripts/07_run_stage2_training.sh --config 260611_Stage2-Talker-H100_ENG.yaml
 ```
 
-Multi-GPU is handled automatically — `torchrun` is used when `nvidia-smi` detects more than one GPU.
+What happens at startup:
+1. Model loads from `model_name_or_path` (Stage 1 merged checkpoint).
+2. `_patched_talker_forward` is monkey-patched onto the model class.
+3. All parameters are frozen; PEFT adds LoRA to the target attention modules.
+4. `TalkerDataCollatorPatched` walks the model to find the CosyVoice2 codec and caches it.
+5. Training begins — the collator encodes each batch's `.wav` files into first-codebook
+   token IDs at runtime; the patched forward builds the correct `inputs_embeds` for the
+   Talker and lets `talker.forward()` compute the cross-entropy loss via `codec_head`.
 
-Output lands in the `output_dir` set in the config (`outputs/stage2_talker_h100/` or `outputs/stage2_talker_bnb/`).
+Output lands in the `output_dir` set in the config
+(`outputs/stage2_talker_h100/` or `outputs/stage2_talker_bnb/`).
+
+---
 
 ### Step 5 — Merge Stage 2 LoRA into the final model
-
-Stage 2 training saves only the LoRA adapter. This step bakes it into `stage1_merged` to produce
-a single standalone HuggingFace checkpoint ready for inference or deployment.
 
 ```bash
 # Auto-detects stage2_talker_h100 or stage2_talker_bnb automatically
@@ -261,8 +314,10 @@ python scripts/11_merge_stage2_lora.py \
     --output_dir  ./outputs/final_model
 ```
 
-The merge runs on CPU in bfloat16 — no GPU needed, but requires enough RAM to hold the model
-(~60 GB for the 30B model). Output is sharded into 4 GB safetensor files in `outputs/final_model/`.
+The merge runs on CPU in bfloat16 — no GPU needed, but requires ~60 GB RAM.
+Output is sharded into 4 GB safetensor files in `outputs/final_model/`.
+
+---
 
 ### Step 6 — Test the final model
 
@@ -286,8 +341,8 @@ python scripts/08_test_inference.py \
 | `learning_rate` | stage1_lora_config.yaml | 1e-4 to 3e-4 for LoRA |
 | `target_sr` | 06_prepare_stage2_manifest.py | Must match Qwen Omni native rate (24 kHz) |
 | `lora.rank` | Stage 2 HF configs | 8–32; H100 config uses 16, BnB uses 8 |
+| `lora.target_modules_regex` | Stage 2 HF configs | Matches thinker attention projections by default; update if targeting talker layers |
 | `training.per_device_train_batch_size` | Stage 2 HF configs | 8 on H100; 2 on 24 GB — reduce if OOM |
 | `training.gradient_accumulation_steps` | Stage 2 HF configs | Adjust to keep effective batch = 32 |
 | `quantization.load_in_8bit` | 260611_Stage2-Talker-H100_ENG.yaml | Switch to `load_in_4bit` if OOM on H100 |
 | `quantization.bnb_4bit_compute_dtype` | talker_finetune_bnb.yaml | `bfloat16` on A100/H100; `float16` on consumer GPUs |
-| `lora.talker_module_regex` | Stage 2 HF configs | If no modules match at startup, the script prints an inspect command; update this regex |

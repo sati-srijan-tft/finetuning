@@ -25,7 +25,6 @@ import soundfile as sf
 import librosa
 
 import torch
-from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import yaml
 from datasets import Dataset
@@ -53,73 +52,80 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _patched_talker_forward(
-    self, 
-    input_ids=None, 
-    attention_mask=None, 
-    audio_codes=None, # The RVQ target codes from your updated collator
-    **kwargs
+    self,
+    input_ids=None,
+    attention_mask=None,
+    audio_codes=None,  # [B, audio_len] — first-codebook token IDs from CosyVoice2
+    **kwargs,
 ):
-    # 1. Run the Thinker (Text LLM)
-    # Strip text labels — they belong to the text LM loss, not the Talker codec loss.
-    # Passing them through causes the frozen thinker to compute unnecessary text loss.
-    kwargs.pop("labels", None)
-    thinker_outputs = self.thinker(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-        return_dict=True,
-        **kwargs
-    )
-    
-    # Extract the final hidden state from the Thinker
-    thinker_hidden_states = thinker_outputs.hidden_states[-1]
-    
-    # 2. Run the Talker
-    # The safetensors confirm 'hidden_projection' is inside 'talker'.
-    # We pass the thinker's hidden states directly into the talker.
-    talker_outputs = self.talker(
-        hidden_states=thinker_hidden_states,
-        audio_codes=audio_codes 
-    )
-    
-    # Extract logits. 
-    # Qwen-Omni returns logits for all 15 codebooks. 
-    # Shape is typically [batch_size, seq_len, 15, vocab_size] OR a tuple of 15 tensors.
-    logits = talker_outputs.logits if hasattr(talker_outputs, "logits") else talker_outputs
-    
-    # 3. Compute Audio Codec Loss across all 15 heads
-    loss = None
-    if audio_codes is not None:
-        loss_fct = CrossEntropyLoss()
-        loss = torch.zeros(1, device=audio_codes.device, dtype=torch.float32)
-        num_codebooks = 15  # Confirmed by talker.code_predictor.lm_head.0 through .14
-        
-        # We iterate through the 15 codebook heads
-        for i in range(num_codebooks):
-            # Check if logits are returned as a stacked tensor or a tuple/list
-            if isinstance(logits, (tuple, list)):
-                cb_logits = logits[i][:, :-1, :].contiguous()
-            else:
-                # Shape: [batch, seq_len, num_codebooks, vocab_size]
-                cb_logits = logits[:, :-1, i, :].contiguous()
-                
-            # Targets shape: [batch, num_codebooks, seq_len]
-            cb_labels = audio_codes[:, i, 1:].contiguous()
-            
-            # Calculate Cross-Entropy loss for this specific codebook
-            cb_loss = loss_fct(
-                cb_logits.view(-1, cb_logits.size(-1)), 
-                cb_labels.view(-1)
-            )
-            loss += cb_loss
-            
-        # Average the loss across all 15 codebook predictors
-        loss = loss / num_codebooks
+    """
+    Patched forward for Qwen3OmniMoeForConditionalGeneration (which has no forward() of its own).
 
-    # 4. Return standard HF output so the Trainer can run backward() and log progress
+    Training the Talker's first-codebook predictor (codec_head):
+      • The Talker does NOT accept hidden_states directly; it takes inputs_embeds.
+      • Text tokens are projected via  talker.text_projection(thinker.embed_tokens(input_ids)).
+      • A 5-token codec special prefix is prepended (nothink / think_bos / think_eos / pad / bos).
+      • Teacher-forced audio tokens follow: talker.get_input_embeddings()(audio_codes[:, :-1]).
+      • Labels = -100 for text+prefix positions, audio_codes[:, 1:] for the audio region.
+      • Loss is computed inside talker.forward() via its loss_function on the first codebook.
+
+    audio_codes must be 1-D codec token IDs (shape [B, T_audio]) in the Talker's codec
+    vocabulary.  These come from the CosyVoice2 speech tokenizer — there is no encoder
+    inside the Qwen3-Omni model itself.
+    """
+    kwargs.pop("labels", None)
+
+    batch_size, text_len = input_ids.shape
+    talker_cfg = self.config.talker_config
+    device = input_ids.device
+
+    # 1. Project thinker word embeddings → talker hidden size.
+    #    text_projection maps thinker embedding dim → talker hidden dim (1024).
+    #    We use word embeddings (not hidden states) — matching how generate() builds
+    #    the talker prefix in _get_talker_assistant_parts.
+    with torch.no_grad():
+        thinker_embed = self.thinker.get_input_embeddings()(input_ids)  # [B, T, H_thinker]
+    text_embeds = self.talker.text_projection(thinker_embed)  # [B, T, H_talker]
+
+    # 2. Codec special-token prefix  (5 tokens, all from the talker's own embedding table)
+    special_ids = torch.tensor(
+        [talker_cfg.codec_nothink_id, talker_cfg.codec_think_bos_id,
+         talker_cfg.codec_think_eos_id, talker_cfg.codec_pad_id, talker_cfg.codec_bos_id],
+        device=device, dtype=torch.long,
+    ).unsqueeze(0).expand(batch_size, -1)  # [B, 5]
+
+    talker_emb = self.talker.get_input_embeddings()
+    special_embeds    = talker_emb(special_ids)           # [B, 5,          H_talker]
+    audio_in_embeds   = talker_emb(audio_codes[:, :-1])   # [B, T_audio-1,  H_talker]
+
+    # 3. Full inputs_embeds:  [text projection] + [codec prefix] + [audio teacher-forced]
+    inputs_embeds = torch.cat([text_embeds, special_embeds, audio_in_embeds], dim=1)
+
+    # 4. Labels: -100 for text + 5-token prefix; first-codebook targets for audio region
+    n_prefix = text_len + 5
+    labels = torch.cat([
+        input_ids.new_full((batch_size, n_prefix), -100),
+        audio_codes[:, 1:],  # next-token targets
+    ], dim=1)
+
+    # 5. Extend attention mask to cover the appended codec tokens
+    n_extra = 5 + audio_codes.shape[1] - 1
+    full_mask = torch.cat([
+        attention_mask,
+        attention_mask.new_ones(batch_size, n_extra),
+    ], dim=1)
+
+    # 6. Run the Talker (computes codec_head loss on first codebook via its loss_function)
+    talker_out = self.talker(
+        inputs_embeds=inputs_embeds,
+        attention_mask=full_mask,
+        labels=labels,
+        talker_input_ids=input_ids,  # used only for 3-D RoPE, not for loss
+    )
+
     return CausalLMOutputWithPast(
-        loss=loss,
-        logits=logits
+        loss=talker_out.loss,
+        logits=talker_out.logits,
     )
 
 def load_config(path: str) -> dict:
@@ -320,38 +326,51 @@ class TalkerDataCollatorPatched:
             truncation=True,
         )
 
-        # 3. Encode audio waveforms → discrete RVQ target codes
+        # 3. Encode audio waveforms → first-codebook token IDs  [B, T_audio]
+        #
+        #    The Talker's codec vocabulary has num_code_groups=32 residual codebooks.
+        #    The patched forward trains only the first codebook (predicted by codec_head).
+        #    Tokens must be valid IDs in the Talker's codec embedding table.
+        #
+        #    SOURCE: CosyVoice2 speech tokenizer — there is no audio encoder inside
+        #    the Qwen3-Omni model itself.  Load it separately, e.g.:
+        #       from cosyvoice.cli.cosyvoice import CosyVoice2
+        #       cv = CosyVoice2('FunAudioLLM/CosyVoice2-0.5B')
+        #       tokens = cv.frontend.tokenize_audio(waveform, sample_rate)
         if self._codec is None:
             raise RuntimeError(
-                "No codec encoder available. Load the CosyVoice2 codec separately "
-                "and pass it to TalkerDataCollatorPatched. "
-                "See the startup warning above for the talker structure."
+                "No CosyVoice2 speech tokenizer available.\n"
+                "The Qwen3-Omni model contains no audio encoder; codec tokens must be\n"
+                "produced externally.  See the startup warning above for the talker\n"
+                "module structure, and load CosyVoice2 from FunAudioLLM/CosyVoice2-0.5B."
             )
 
         with torch.no_grad():
             codec_device = next(self._codec.parameters()).device
             all_codes = []
             for waveform in audios:
-                # codec expects [batch=1, channels=1, time]
                 wav_t = torch.FloatTensor(waveform).unsqueeze(0).unsqueeze(0).to(codec_device)
                 result = self._codec.encode(wav_t)
-                # result may be (codes, scale) or just codes; codes: [1, n_cb, T']
+                # result may be (codes, scale) tuple or just codes
                 codes = result[0] if isinstance(result, (list, tuple)) else result
-                all_codes.append(codes.squeeze(0))  # [n_cb, T']
-            max_t = max(c.shape[-1] for c in all_codes)
-            n_cb = all_codes[0].shape[0]
-            audio_codes = torch.zeros(len(all_codes), n_cb, max_t, dtype=torch.long, device=codec_device)
-            for i, c in enumerate(all_codes):
-                audio_codes[i, :, :c.shape[-1]] = c
+                # codes shape: [1, n_codebooks, T'] — keep only first codebook → [T']
+                all_codes.append(codes[0, 0, :])  # [T']
 
-        # 4. Text labels (causal LM, padding masked)
+            # Pad first-codebook sequences to same length → [B, T_audio]
+            max_t = max(c.shape[0] for c in all_codes)
+            audio_codes = torch.zeros(len(all_codes), max_t, dtype=torch.long, device=codec_device)
+            for i, c in enumerate(all_codes):
+                audio_codes[i, :c.shape[0]] = c
+
+        # 4. Text labels — patched forward computes audio loss internally;
+        #    the Trainer also expects a 'labels' key (for eval_loss bookkeeping).
         labels = encoded["input_ids"].clone()
         if "attention_mask" in encoded:
             labels[encoded["attention_mask"] == 0] = -100
         encoded["labels"] = labels
 
-        # 5. Inject codec targets for the patched forward pass
-        encoded["audio_codes"] = audio_codes.long().to(self._model_device)
+        # 5. First-codebook audio targets for the patched forward pass  [B, T_audio]
+        encoded["audio_codes"] = audio_codes.to(self._model_device)
 
         return encoded
     
