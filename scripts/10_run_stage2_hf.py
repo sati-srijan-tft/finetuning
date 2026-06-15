@@ -302,12 +302,12 @@ class TalkerDataCollatorPatched:
         )
 
         # 3. Extract first-codebook speech tokens via CosyVoice2's ONNX tokenizer
-        #    frontend.extract_speech_token(speech_np [B,T], lengths_np [B]) → list of token arrays
+        #    frontend._extract_speech_token(speech_np [B,T], lengths_np [B]) → list of token arrays
         all_tokens = []
         for wav in audio16k_list:
             speech_np  = wav[np.newaxis, :].astype(np.float32)         # [1, T]
             length_np  = np.array([speech_np.shape[1]], dtype=np.int32) # [1]
-            tokens = self._cv.frontend.extract_speech_token(speech_np, length_np)
+            tokens = self._cv.frontend._extract_speech_token(speech_np, length_np)
             tok = tokens[0] if isinstance(tokens, (list, tuple)) else tokens
             all_tokens.append(torch.from_numpy(np.asarray(tok)).long())
 

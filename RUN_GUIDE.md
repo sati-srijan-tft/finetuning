@@ -259,7 +259,7 @@ pip install conformer==0.3.2 omegaconf hydra-core hyperpyyaml WeTextProcessing \
 huggingface-cli download FunAudioLLM/CosyVoice2-0.5B --local-dir ./cosyvoice2-0.5b
 
 
-pip pip install openai-whisper inflect
+pip pip install openai-whisper inflect lightning diffusers gdown wget pyworld 
 # Verify the import works:
 python -c "
 import sys; sys.path.insert(0, './third_party/CosyVoice')
