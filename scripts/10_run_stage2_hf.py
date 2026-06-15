@@ -409,8 +409,12 @@ def main():
     # --- CosyVoice2 speech tokenizer ---
     cosyvoice_repo = data_cfg.get("cosyvoice_repo", "./third_party/CosyVoice")
     cosyvoice_path = data_cfg.get("cosyvoice_path", "./cosyvoice2-0.5b")
-    if cosyvoice_repo not in sys.path:
-        sys.path.insert(0, cosyvoice_repo)
+    # matcha-tts ships as a submodule of CosyVoice; add it before importing
+    for _extra in [cosyvoice_repo,
+                   f"{cosyvoice_repo}/third_party/matcha-tts",
+                   f"{cosyvoice_repo}/third_party/Matcha-TTS"]:
+        if _extra not in sys.path:
+            sys.path.insert(0, _extra)
     from cosyvoice.cli.cosyvoice import CosyVoice2
     print(f"  Loading CosyVoice2 from {cosyvoice_path} ...")
     cosyvoice = CosyVoice2(cosyvoice_path)
