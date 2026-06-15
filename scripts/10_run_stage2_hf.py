@@ -248,102 +248,110 @@ class TalkerDataCollator:
 class TalkerDataCollatorPatched:
     def __init__(self, processor, model, sample_rate=24000):
         self.processor = processor
-        self.model = model  # Passed in so we can access the audio tokenizer/encoder
         self.sample_rate = sample_rate
+        # Resolve and cache the codec encoder at init so __call__ is simple.
+        # Must run in the main process (dataloader_num_workers=0).
+        self._codec, self._model_device = self._resolve_codec(model)
+
+    @staticmethod
+    def _unwrap(model):
+        """Strip PeftModel / LoraModel wrappers to reach the bare HF model."""
+        m = model
+        for _ in range(6):
+            # PeftModel: .base_model → LoraModel; LoraModel: .model → actual model
+            if hasattr(m, 'base_model'):
+                m = m.base_model
+            elif hasattr(m, 'model'):
+                m = m.model
+            else:
+                break
+        return m
+
+    def _resolve_codec(self, model):
+        model_device = next(model.parameters()).device
+        base = self._unwrap(model)
+        talker = getattr(base, 'talker', None)
+
+        if talker is not None:
+            # Try known attribute names for the CosyVoice2 / EnCodec style codec
+            for attr in ('codec', 'codec_model', 'audio_codec', 'speech_tokenizer',
+                         'cosyvoice', 'vocos', 'encodec'):
+                cand = getattr(talker, attr, None)
+                if cand is not None and callable(getattr(cand, 'encode', None)):
+                    print(f"  Codec encoder found at model.talker.{attr}  [{type(cand).__name__}]")
+                    return cand, model_device
+
+            # Codec not found — print talker's direct children to help the user locate it
+            children = [(n, type(c).__name__) for n, c in talker.named_children()]
+            print(f"\nWARNING: No codec with .encode() found in Talker ({type(talker).__name__}).")
+            print("Talker's direct children:")
+            for n, t in children:
+                print(f"  .{n}  [{t}]")
+        else:
+            print("\nWARNING: .talker not found on the base model.")
+            top_children = [(n, type(c).__name__) for n, c in base.named_children()]
+            print("Base model children:", top_children)
+
+        print(
+            "\nThe CosyVoice2 codec encoder is not embedded in this model checkpoint.\n"
+            "You need to load it separately and pass it via the `codec_model` argument.\n"
+            "See: https://huggingface.co/FunAudioLLM/CosyVoice2-0.5B\n"
+        )
+        return None, model_device
 
     def __call__(self, batch):
         texts = []
         audios = []
-        
-        # 1. Load and resample audio files exactly like your original code
+
+        # 1. Load and resample audio
         for entry in batch:
             texts.append(entry.get("text", ""))
-            
-            # Load audio file
             waveform, sr = sf.read(entry["audio_filepath"], dtype="float32")
-            
-            # Resample if sample rate doesn't match
             if sr != self.sample_rate:
                 waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.sample_rate)
-                
             audios.append(waveform)
 
-        # 2. Extract input features (spectrograms/prompts) via the processor
+        # 2. Tokenise TEXT ONLY — the processor ignores 'audios' for Qwen3-Omni TTS.
+        #    Audio codes are the training TARGET, not the input.
         encoded = self.processor(
             text=texts,
-            audios=audios,
-            sampling_rate=self.sample_rate,
             return_tensors="pt",
             padding=True,
             truncation=True,
         )
 
-        # 3. Extract the discrete target RVQ codes from the raw audios.
-        # NOTE: this must run in the main process (dataloader_num_workers=0) because
-        # self.model lives on the GPU and is not accessible from DataLoader subprocesses.
+        # 3. Encode audio waveforms → discrete RVQ target codes
+        if self._codec is None:
+            raise RuntimeError(
+                "No codec encoder available. Load the CosyVoice2 codec separately "
+                "and pass it to TalkerDataCollatorPatched. "
+                "See the startup warning above for the talker structure."
+            )
+
         with torch.no_grad():
-            audio_codes = None
+            codec_device = next(self._codec.parameters()).device
+            all_codes = []
+            for waveform in audios:
+                # codec expects [batch=1, channels=1, time]
+                wav_t = torch.FloatTensor(waveform).unsqueeze(0).unsqueeze(0).to(codec_device)
+                result = self._codec.encode(wav_t)
+                # result may be (codes, scale) or just codes; codes: [1, n_cb, T']
+                codes = result[0] if isinstance(result, (list, tuple)) else result
+                all_codes.append(codes.squeeze(0))  # [n_cb, T']
+            max_t = max(c.shape[-1] for c in all_codes)
+            n_cb = all_codes[0].shape[0]
+            audio_codes = torch.zeros(len(all_codes), n_cb, max_t, dtype=torch.long, device=codec_device)
+            for i, c in enumerate(all_codes):
+                audio_codes[i, :, :c.shape[-1]] = c
 
-            if hasattr(self.model, "encode_audio"):
-                audio_codes = self.model.encode_audio(audios, sampling_rate=self.sample_rate)
-
-            elif (hasattr(self.model, "talker") and
-                  hasattr(self.model.talker, "codec_model")):
-                # Qwen3-Omni: the CosyVoice codec lives inside model.talker.codec_model
-                codec = self.model.talker.codec_model
-                codec_device = next(codec.parameters()).device
-                all_codes = []
-                for waveform in audios:
-                    # codec expects [batch=1, channels=1, time]
-                    wav_t = torch.FloatTensor(waveform).unsqueeze(0).unsqueeze(0).to(codec_device)
-                    result = codec.encode(wav_t)
-                    # result may be (codes, scale) or just codes; codes shape [1, n_cb, T']
-                    codes = result[0] if isinstance(result, (list, tuple)) else result
-                    all_codes.append(codes.squeeze(0))  # [n_cb, T']
-                max_t = max(c.shape[-1] for c in all_codes)
-                n_cb = all_codes[0].shape[0]
-                padded = torch.zeros(len(all_codes), n_cb, max_t, dtype=torch.long, device=codec_device)
-                for i, c in enumerate(all_codes):
-                    padded[i, :, :c.shape[-1]] = c
-                audio_codes = padded
-
-            elif hasattr(self.model, "audio_encoder"):
-                audio_features = self.processor.feature_extractor(audios, sampling_rate=self.sample_rate, return_tensors="pt")
-                audio_features = {k: v.to(self.model.device) for k, v in audio_features.items()}
-                audio_codes = self.model.audio_encoder.encode(**audio_features)
-
-            else:
-                audio_codes = encoded.get("audio_codes", None)
-                if audio_codes is None:
-                    codec_related = [
-                        n for n, _ in self.model.named_modules()
-                        if any(k in n.lower() for k in ("codec", "audio", "quantiz", "vq"))
-                    ]
-                    raise ValueError(
-                        "Could not extract 'audio_codes'. Codec-related modules found:\n"
-                        f"  {codec_related[:30]}\n"
-                        "Update the codec encoding path in TalkerDataCollatorPatched."
-                    )
-
-        # 4. Set up standard text labels
+        # 4. Text labels (causal LM, padding masked)
         labels = encoded["input_ids"].clone()
         if "attention_mask" in encoded:
             labels[encoded["attention_mask"] == 0] = -100
         encoded["labels"] = labels
-        
-        # 5. Inject the extracted discrete codes so our patched forward pass can read them
-        if audio_codes is not None:
-            # Ensure it's a long tensor for CrossEntropyLoss mapping
-            encoded["audio_codes"] = audio_codes.long().to(self.model.device)
-        else:
-            raise ValueError(
-                "Could not extract 'audio_codes' from the batch. Double check your model's audio encoding method name."
-            )
-            
-        # 6. CRITICAL STEP: Delete the raw 'audios' key.
-        # This completely stops the HuggingFace Trainer from throwing the "ignoring column" warning!
-        if "audios" in encoded:
-            del encoded["audios"]
+
+        # 5. Inject codec targets for the patched forward pass
+        encoded["audio_codes"] = audio_codes.long().to(self._model_device)
 
         return encoded
     
