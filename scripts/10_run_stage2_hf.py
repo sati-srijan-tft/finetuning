@@ -252,73 +252,48 @@ class TalkerDataCollator:
         return encoded
 
 class TalkerDataCollatorPatched:
-    def __init__(self, processor, model, sample_rate=24000):
-        self.processor = processor
+    """
+    Collator for Stage 2 Talker fine-tuning.
+
+    Requires a CosyVoice2 instance for audio → speech-token encoding.
+    The speech tokenizer runs at 16 kHz (Whisper-based ONNX model inside CosyVoice2).
+    Audio files may be at any sample rate; this class resamples automatically.
+    """
+
+    COSYVOICE_SR = 16000  # CosyVoice2 speech tokenizer input rate
+
+    def __init__(self, processor, model, sample_rate=24000, cosyvoice=None):
+        self.processor   = processor
         self.sample_rate = sample_rate
-        # Resolve and cache the codec encoder at init so __call__ is simple.
-        # Must run in the main process (dataloader_num_workers=0).
-        self._codec, self._model_device = self._resolve_codec(model)
+        self._model_device = next(model.parameters()).device
 
-    @staticmethod
-    def _unwrap(model):
-        """Strip PeftModel / LoraModel wrappers to reach the bare HF model."""
-        m = model
-        for _ in range(6):
-            # PeftModel: .base_model → LoraModel; LoraModel: .model → actual model
-            if hasattr(m, 'base_model'):
-                m = m.base_model
-            elif hasattr(m, 'model'):
-                m = m.model
-            else:
-                break
-        return m
-
-    def _resolve_codec(self, model):
-        model_device = next(model.parameters()).device
-        base = self._unwrap(model)
-        talker = getattr(base, 'talker', None)
-
-        if talker is not None:
-            # Try known attribute names for the CosyVoice2 / EnCodec style codec
-            for attr in ('codec', 'codec_model', 'audio_codec', 'speech_tokenizer',
-                         'cosyvoice', 'vocos', 'encodec'):
-                cand = getattr(talker, attr, None)
-                if cand is not None and callable(getattr(cand, 'encode', None)):
-                    print(f"  Codec encoder found at model.talker.{attr}  [{type(cand).__name__}]")
-                    return cand, model_device
-
-            # Codec not found — print talker's direct children to help the user locate it
-            children = [(n, type(c).__name__) for n, c in talker.named_children()]
-            print(f"\nWARNING: No codec with .encode() found in Talker ({type(talker).__name__}).")
-            print("Talker's direct children:")
-            for n, t in children:
-                print(f"  .{n}  [{t}]")
-        else:
-            print("\nWARNING: .talker not found on the base model.")
-            top_children = [(n, type(c).__name__) for n, c in base.named_children()]
-            print("Base model children:", top_children)
-
-        print(
-            "\nThe CosyVoice2 codec encoder is not embedded in this model checkpoint.\n"
-            "You need to load it separately and pass it via the `codec_model` argument.\n"
-            "See: https://huggingface.co/FunAudioLLM/CosyVoice2-0.5B\n"
-        )
-        return None, model_device
+        if cosyvoice is None:
+            raise RuntimeError(
+                "CosyVoice2 is required but was not passed.\n"
+                "Set up with:\n"
+                "  git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git third_party/CosyVoice\n"
+                "  pip install openai-whisper conformer omegaconf hydra-core hyperpyyaml WeTextProcessing onnxruntime-gpu torchaudio\n"
+                "  huggingface-cli download FunAudioLLM/CosyVoice2-0.5B --local-dir ./cosyvoice2-0.5b\n"
+                "Then add cosyvoice_repo / cosyvoice_path to your data: config block."
+            )
+        self._cv = cosyvoice
+        print(f"  CosyVoice2 speech tokenizer ready  [{type(cosyvoice).__name__}]")
 
     def __call__(self, batch):
-        texts = []
-        audios = []
+        import numpy as np
 
-        # 1. Load and resample audio
+        texts        = []
+        audio16k_list = []  # 16 kHz waveforms for CosyVoice2 speech tokenizer
+
+        # 1. Load audio + resample to 16 kHz for the speech tokenizer
         for entry in batch:
             texts.append(entry.get("text", ""))
             waveform, sr = sf.read(entry["audio_filepath"], dtype="float32")
-            if sr != self.sample_rate:
-                waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.sample_rate)
-            audios.append(waveform)
+            if sr != self.COSYVOICE_SR:
+                waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.COSYVOICE_SR)
+            audio16k_list.append(waveform)
 
-        # 2. Tokenise TEXT ONLY — the processor ignores 'audios' for Qwen3-Omni TTS.
-        #    Audio codes are the training TARGET, not the input.
+        # 2. Tokenise TEXT ONLY — audio codes are the TARGET, not a model input
         encoded = self.processor(
             text=texts,
             return_tensors="pt",
@@ -326,52 +301,30 @@ class TalkerDataCollatorPatched:
             truncation=True,
         )
 
-        # 3. Encode audio waveforms → first-codebook token IDs  [B, T_audio]
-        #
-        #    The Talker's codec vocabulary has num_code_groups=32 residual codebooks.
-        #    The patched forward trains only the first codebook (predicted by codec_head).
-        #    Tokens must be valid IDs in the Talker's codec embedding table.
-        #
-        #    SOURCE: CosyVoice2 speech tokenizer — there is no audio encoder inside
-        #    the Qwen3-Omni model itself.  Load it separately, e.g.:
-        #       from cosyvoice.cli.cosyvoice import CosyVoice2
-        #       cv = CosyVoice2('FunAudioLLM/CosyVoice2-0.5B')
-        #       tokens = cv.frontend.tokenize_audio(waveform, sample_rate)
-        if self._codec is None:
-            raise RuntimeError(
-                "No CosyVoice2 speech tokenizer available.\n"
-                "The Qwen3-Omni model contains no audio encoder; codec tokens must be\n"
-                "produced externally.  See the startup warning above for the talker\n"
-                "module structure, and load CosyVoice2 from FunAudioLLM/CosyVoice2-0.5B."
-            )
+        # 3. Extract first-codebook speech tokens via CosyVoice2's ONNX tokenizer
+        #    frontend.extract_speech_token(speech_np [B,T], lengths_np [B]) → list of token arrays
+        all_tokens = []
+        for wav in audio16k_list:
+            speech_np  = wav[np.newaxis, :].astype(np.float32)         # [1, T]
+            length_np  = np.array([speech_np.shape[1]], dtype=np.int32) # [1]
+            tokens = self._cv.frontend.extract_speech_token(speech_np, length_np)
+            tok = tokens[0] if isinstance(tokens, (list, tuple)) else tokens
+            all_tokens.append(torch.from_numpy(np.asarray(tok)).long())
 
-        with torch.no_grad():
-            codec_device = next(self._codec.parameters()).device
-            all_codes = []
-            for waveform in audios:
-                wav_t = torch.FloatTensor(waveform).unsqueeze(0).unsqueeze(0).to(codec_device)
-                result = self._codec.encode(wav_t)
-                # result may be (codes, scale) tuple or just codes
-                codes = result[0] if isinstance(result, (list, tuple)) else result
-                # codes shape: [1, n_codebooks, T'] — keep only first codebook → [T']
-                all_codes.append(codes[0, 0, :])  # [T']
+        # Pad → [B, T_audio]
+        max_t      = max(t.shape[0] for t in all_tokens)
+        audio_codes = torch.zeros(len(all_tokens), max_t, dtype=torch.long)
+        for i, t in enumerate(all_tokens):
+            audio_codes[i, :t.shape[0]] = t
 
-            # Pad first-codebook sequences to same length → [B, T_audio]
-            max_t = max(c.shape[0] for c in all_codes)
-            audio_codes = torch.zeros(len(all_codes), max_t, dtype=torch.long, device=codec_device)
-            for i, c in enumerate(all_codes):
-                audio_codes[i, :c.shape[0]] = c
-
-        # 4. Text labels — patched forward computes audio loss internally;
-        #    the Trainer also expects a 'labels' key (for eval_loss bookkeeping).
+        # 4. Text labels (Trainer needs 'labels' for eval_loss; audio loss is in patched forward)
         labels = encoded["input_ids"].clone()
         if "attention_mask" in encoded:
             labels[encoded["attention_mask"] == 0] = -100
         encoded["labels"] = labels
 
-        # 5. First-codebook audio targets for the patched forward pass  [B, T_audio]
+        # 5. First-codebook audio targets for _patched_talker_forward  [B, T_audio]
         encoded["audio_codes"] = audio_codes.to(self._model_device)
-
         return encoded
     
 # ---------------------------------------------------------------------------
@@ -453,7 +406,21 @@ def main():
     )
     print(f"Train samples: {len(train_entries)}  |  Val samples: {len(val_entries)}")
 
-    collator = TalkerDataCollatorPatched(processor=processor, model= model, sample_rate=data_cfg["sample_rate"])
+    # --- CosyVoice2 speech tokenizer ---
+    cosyvoice_repo = data_cfg.get("cosyvoice_repo", "./third_party/CosyVoice")
+    cosyvoice_path = data_cfg.get("cosyvoice_path", "./cosyvoice2-0.5b")
+    if cosyvoice_repo not in sys.path:
+        sys.path.insert(0, cosyvoice_repo)
+    from cosyvoice.cli.cosyvoice import CosyVoice2
+    print(f"  Loading CosyVoice2 from {cosyvoice_path} ...")
+    cosyvoice = CosyVoice2(cosyvoice_path)
+
+    collator = TalkerDataCollatorPatched(
+        processor=processor,
+        model=model,
+        sample_rate=data_cfg["sample_rate"],
+        cosyvoice=cosyvoice,
+    )
 
     # --- TrainingArguments ---
     training_args = TrainingArguments(

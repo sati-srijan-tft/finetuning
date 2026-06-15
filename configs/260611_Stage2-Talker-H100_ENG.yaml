@@ -72,6 +72,8 @@ training:
 data:
   train_manifest: "./manifests/train_manifest.json"
   val_manifest: "./manifests/val_manifest.json"
-  sample_rate: 24000               # must match Qwen Omni native rate
+  sample_rate: 24000               # Qwen Omni native rate (audio is downsampled to 16 kHz internally for CosyVoice2)
   max_duration: 30.0
   min_duration: 0.5
+  cosyvoice_repo: "./third_party/CosyVoice"   # path to cloned CosyVoice repo (added to sys.path)
+  cosyvoice_path: "./cosyvoice2-0.5b"          # path to downloaded CosyVoice2-0.5B weights

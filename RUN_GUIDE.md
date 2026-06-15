@@ -241,20 +241,45 @@ python scripts/06_prepare_stage2_manifest.py \
 pip install transformers peft bitsandbytes accelerate soundfile tensorboard
 pip install librosa   # needed if audio is not already at 24 kHz
 
-# CosyVoice2 speech tokenizer — required to encode training audio into codec token IDs
-pip install git+https://github.com/FunAudioLLM/CosyVoice.git
-# Then download the tokenizer weights:
+# CosyVoice2 speech tokenizer — required to encode training audio into codec token IDs.
+# CosyVoice has no setup.py; clone it and add to sys.path instead:
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git third_party/CosyVoice
+
+# Fix pkg_resources first (ships with setuptools; may be missing in some venvs):
+pip install --upgrade setuptools
+
+# Install only the deps needed for audio tokenization — skip server/distributed deps
+# (gradio, deepspeed, grpcio, fastapi are in requirements.txt but not needed here):
+pip install conformer==0.3.2 omegaconf hydra-core hyperpyyaml WeTextProcessing \
+            onnxruntime-gpu torchaudio
+# If onnxruntime-gpu conflicts with your CUDA version, use: onnxruntime  (CPU is fine)
+# If pynini fails (needs OpenFst), skip it — only used for Chinese text normalisation
+
+# Download the CosyVoice2-0.5B weights:
 huggingface-cli download FunAudioLLM/CosyVoice2-0.5B --local-dir ./cosyvoice2-0.5b
+
+
+pip pip install openai-whisper inflect
+# Verify the import works:
+python -c "
+import sys; sys.path.insert(0, './third_party/CosyVoice')
+from cosyvoice.cli.cosyvoice import CosyVoice2; print('OK')
+"
 ```
 
-> **Why CosyVoice2?**  The Talker is trained to predict discrete codec tokens (first of 32
-> codebooks). Those tokens come from CosyVoice2's speech tokenizer — there is no equivalent
-> encoder anywhere inside `Qwen3-Omni`.  The collator calls it at runtime to encode each
-> `.wav` into target token IDs.
+> **Why CosyVoice2?**  The Talker predicts discrete codec tokens (first of 32 codebooks).
+> Those tokens come from CosyVoice2's speech tokenizer — there is no equivalent audio encoder
+> inside `Qwen3-Omni` itself (`Code2Wav` is decoder-only).  The collator calls it at runtime
+> to convert each `.wav` in the batch into target token IDs.
 
-Wire up the codec in `TalkerDataCollatorPatched.__init__` by loading CosyVoice2 and passing
-it as `codec_model` (the collator currently auto-discovers it; if discovery fails it prints
-the talker's child modules and exits cleanly with a message).
+The `CosyVoice` repo must be on `sys.path` before importing:
+```python
+import sys
+sys.path.insert(0, './third_party/CosyVoice')
+from cosyvoice.cli.cosyvoice import CosyVoice2
+cv = CosyVoice2('./cosyvoice2-0.5b')
+# cv.frontend.extract_speech_token(waveform_tensor, sample_rate) → token IDs
+```
 
 ---
 
