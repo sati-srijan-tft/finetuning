@@ -21,8 +21,12 @@ import re
 import sys
 from pathlib import Path
 from typing import Dict, List
+import soundfile as sf
+import librosa
 
 import torch
+from torch.nn import CrossEntropyLoss
+from transformers.modeling_outputs import CausalLMOutputWithPast
 import yaml
 from datasets import Dataset
 from peft import LoraConfig, TaskType, get_peft_model
@@ -46,6 +50,76 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
+
+def _patched_talker_forward(
+    self, 
+    input_ids=None, 
+    attention_mask=None, 
+    audio_codes=None, # The RVQ target codes from your updated collator
+    **kwargs
+):
+    # 1. Run the Thinker (Text LLM)
+    # Strip text labels — they belong to the text LM loss, not the Talker codec loss.
+    # Passing them through causes the frozen thinker to compute unnecessary text loss.
+    kwargs.pop("labels", None)
+    thinker_outputs = self.thinker(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        return_dict=True,
+        **kwargs
+    )
+    
+    # Extract the final hidden state from the Thinker
+    thinker_hidden_states = thinker_outputs.hidden_states[-1]
+    
+    # 2. Run the Talker
+    # The safetensors confirm 'hidden_projection' is inside 'talker'.
+    # We pass the thinker's hidden states directly into the talker.
+    talker_outputs = self.talker(
+        hidden_states=thinker_hidden_states,
+        audio_codes=audio_codes 
+    )
+    
+    # Extract logits. 
+    # Qwen-Omni returns logits for all 15 codebooks. 
+    # Shape is typically [batch_size, seq_len, 15, vocab_size] OR a tuple of 15 tensors.
+    logits = talker_outputs.logits if hasattr(talker_outputs, "logits") else talker_outputs
+    
+    # 3. Compute Audio Codec Loss across all 15 heads
+    loss = None
+    if audio_codes is not None:
+        loss_fct = CrossEntropyLoss()
+        loss = torch.zeros(1, device=audio_codes.device, dtype=torch.float32)
+        num_codebooks = 15  # Confirmed by talker.code_predictor.lm_head.0 through .14
+        
+        # We iterate through the 15 codebook heads
+        for i in range(num_codebooks):
+            # Check if logits are returned as a stacked tensor or a tuple/list
+            if isinstance(logits, (tuple, list)):
+                cb_logits = logits[i][:, :-1, :].contiguous()
+            else:
+                # Shape: [batch, seq_len, num_codebooks, vocab_size]
+                cb_logits = logits[:, :-1, i, :].contiguous()
+                
+            # Targets shape: [batch, num_codebooks, seq_len]
+            cb_labels = audio_codes[:, i, 1:].contiguous()
+            
+            # Calculate Cross-Entropy loss for this specific codebook
+            cb_loss = loss_fct(
+                cb_logits.view(-1, cb_logits.size(-1)), 
+                cb_labels.view(-1)
+            )
+            loss += cb_loss
+            
+        # Average the loss across all 15 codebook predictors
+        loss = loss / num_codebooks
+
+    # 4. Return standard HF output so the Trainer can run backward() and log progress
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=logits
+    )
 
 def load_config(path: str) -> dict:
     with open(path) as f:
@@ -170,7 +244,78 @@ class TalkerDataCollator:
         encoded["labels"] = labels
         return encoded
 
+class TalkerDataCollatorPatched:
+    def __init__(self, processor, model, sample_rate=24000):
+        self.processor = processor
+        self.model = model  # Passed in so we can access the audio tokenizer/encoder
+        self.sample_rate = sample_rate
 
+    def __call__(self, batch):
+        texts = []
+        audios = []
+        
+        # 1. Load and resample audio files exactly like your original code
+        for entry in batch:
+            texts.append(entry.get("text", ""))
+            
+            # Load audio file
+            waveform, sr = sf.read(entry["audio_filepath"], dtype="float32")
+            
+            # Resample if sample rate doesn't match
+            if sr != self.sample_rate:
+                waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.sample_rate)
+                
+            audios.append(waveform)
+
+        # 2. Extract input features (spectrograms/prompts) via the processor
+        encoded = self.processor(
+            text=texts,
+            audios=audios,
+            sampling_rate=self.sample_rate,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+
+        # 3. Extract the discrete target RVQ codes from the raw audios.
+        # We wrap this in torch.no_grad() because we don't want to backprop through the audio tokenizer.
+        with torch.no_grad():
+            # Depending on the exact Qwen-Omni HF implementation class, the quantization method 
+            # might be called 'encode_audio', 'quantize', or live inside a sub-module like 'model.audio_encoder'.
+            # A highly reliable way for Qwen Omni models is using the model's native audio tokenization pass:
+            if hasattr(self.model, "encode_audio"):
+                # Returns tensor of shape: [batch, 15, seq_len]
+                audio_codes = self.model.encode_audio(audios, sampling_rate=self.sample_rate)
+            elif hasattr(self.model, "audio_encoder"):
+                audio_features = self.processor.feature_extractor(audios, sampling_rate=self.sample_rate, return_tensors="pt")
+                audio_features = {k: v.to(self.model.device) for k, v in audio_features.items()}
+                audio_codes = self.model.audio_encoder.encode(**audio_features)
+            else:
+                # Fallback fallback check: see if the processor's initial encoding pass already extracted them
+                audio_codes = encoded.get("audio_codes", None)
+
+        # 4. Set up standard text labels
+        labels = encoded["input_ids"].clone()
+        if "attention_mask" in encoded:
+            labels[encoded["attention_mask"] == 0] = -100
+        encoded["labels"] = labels
+        
+        # 5. Inject the extracted discrete codes so our patched forward pass can read them
+        if audio_codes is not None:
+            # Ensure it's a long tensor for CrossEntropyLoss mapping
+            encoded["audio_codes"] = audio_codes.long().to(self.model.device)
+        else:
+            raise ValueError(
+                "Could not extract 'audio_codes' from the batch. Double check your model's audio encoding method name."
+            )
+            
+        # 6. CRITICAL STEP: Delete the raw 'audios' key.
+        # This completely stops the HuggingFace Trainer from throwing the "ignoring column" warning!
+        if "audios" in encoded:
+            del encoded["audios"]
+
+        return encoded
+    
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -202,17 +347,8 @@ def main():
     )
     processor = AutoProcessor.from_pretrained(cfg["model_path"], trust_remote_code=True)
 
-    # ---------------------------------------------------------------------------
-    # Qwen3OmniMoeForConditionalGeneration is a generation-only wrapper: it has
-    # no forward() method, so PEFT's BaseTuner.forward() hits PyTorch's default
-    # _forward_unimplemented. Patch the class to delegate to model.thinker.
-    #
-    # LIMITATION: this routes the training loss through the Thinker (text LM),
-    # not the Talker (audio codec decoder). For full Talker training you need:
-    #   1. Audio codec tokenization in TalkerDataCollator (wav → RVQ codes)
-    #   2. A forward that runs thinker → hidden_projection → talker
-    #   3. Cross-entropy loss over the 15 codec-codebook predictions
-    # ---------------------------------------------------------------------------
+    # Qwen3OmniMoeForConditionalGeneration is a generation-only wrapper with no forward().
+    # Patch it to run thinker → talker with cross-entropy loss over all 15 RVQ codebooks.
     if not any('forward' in cls.__dict__
                for cls in type(model).__mro__
                if cls is not torch.nn.Module):
@@ -222,39 +358,18 @@ def main():
                 f"{type(model).__name__} has no forward() and no .thinker submodule; "
                 "cannot train. Check your transformers version."
             )
-        def _patched_forward(self, *args, **kwargs):
-            return self.thinker(*args, **kwargs)
-        type(model).forward = _patched_forward
-        print(f"  Patched {type(model).__name__}.forward → thinker "
-              "(text-loss proxy; see script comment for full Talker training)")
+        type(model).forward = _patched_talker_forward
+        print(f"  Patched {type(model).__name__}.forward → thinker→talker (audio codec loss)")
 
     # Freeze everything; PEFT will unfreeze adapter params
     for param in model.parameters():
         param.requires_grad = False
 
     # --- LoRA ---
-    # Try the configured regex first (talker layers). If nothing matches the
-    # thinker forward path, fall back to thinker attention layers so LoRA
-    # adapters actually receive gradients.
     regex = lora_cfg["target_modules_regex"]
     target_modules = find_talker_targets(model, regex)
     if not target_modules:
         sys.exit(1)
-
-    # Warn when all matched modules live under talker.* (outside forward path)
-    all_matched = [n for n, _ in model.named_modules() if re.fullmatch(regex, n)]
-    if all_matched and all(n.startswith('talker.') for n in all_matched):
-        fallback_regex = r"thinker\.model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)"
-        print(
-            "\nWARNING: All LoRA targets are in talker.* but the forward path goes through "
-            "thinker — those adapters will receive no gradients.\n"
-            f"  Falling back to thinker attention layers: {fallback_regex}\n"
-            "  To train the Talker, implement audio codec tokenization and a proper "
-            "thinker→talker forward (see script comment above).\n"
-        )
-        target_modules = find_talker_targets(model, fallback_regex)
-        if not target_modules:
-            sys.exit(1)
 
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,  # thinker is a causal LM; PEFT wrapper exposes 'labels' for eval
@@ -280,7 +395,7 @@ def main():
     )
     print(f"Train samples: {len(train_entries)}  |  Val samples: {len(val_entries)}")
 
-    collator = TalkerDataCollator(processor=processor, sample_rate=data_cfg["sample_rate"])
+    collator = TalkerDataCollatorPatched(processor=processor, model= model, sample_rate=data_cfg["sample_rate"])
 
     # --- TrainingArguments ---
     training_args = TrainingArguments(
