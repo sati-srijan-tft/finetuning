@@ -3,14 +3,14 @@ import soundfile as sf
 from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
 from qwen_omni_utils import process_mm_info
 
-MODEL_PATH = "./LLaMA-Factory/outputs/stage1_merged"
-# MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Thinking"
+MODEL_PATH = "./outputs/final_model"
+#MODEL_PATH = "Qwen/Qwen3-Omni-30B-A3B-Thinking"
 
 model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
     MODEL_PATH,
     dtype="auto",
     device_map="auto",
-    attn_implementation="flash_attention_2",
+    attn_implementation="sdpa",
 )
 
 processor = Qwen3OmniMoeProcessor.from_pretrained(MODEL_PATH)
@@ -19,7 +19,7 @@ conversation = [
     {
         "role": "user",
         "content": [
-            {"type": "audio", "audio": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-Omni/demo/cough.wav"},
+            {"type": "audio", "audio": "/ephemeral/workspace/finetuning/Recording.wav"},
             {"type": "text", "text": "Answer the question asked in the audio. Please answer in hindi."}
         ],
     },
@@ -46,9 +46,13 @@ text_ids, audio = model.generate(**inputs,
                                  thinker_return_dict_in_generate=True,
                                  use_audio_in_video=USE_AUDIO_IN_VIDEO)
 
-text = processor.batch_decode(text_ids.sequences[:, inputs["input_ids"].shape[1] :],
-                              skip_special_tokens=True,
-                              clean_up_tokenization_spaces=False)
+text = processor.batch_decode(
+    text_ids[:, inputs["input_ids"].shape[1]:], 
+    skip_special_tokens=True,
+    clean_up_tokenization_spaces=False
+)
+
+print("Response:")
 print(text)
 if audio is not None:
     sf.write(
@@ -56,3 +60,4 @@ if audio is not None:
         audio.reshape(-1).detach().cpu().numpy(),
         samplerate=24000,
     )
+print("audio file saved!")
