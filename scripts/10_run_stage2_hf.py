@@ -280,20 +280,14 @@ class TalkerDataCollatorPatched:
         print(f"  CosyVoice2 speech tokenizer ready  [{type(cosyvoice).__name__}]")
 
     def __call__(self, batch):
-        import numpy as np
+        texts      = []
+        filepaths  = []
 
-        texts        = []
-        audio16k_list = []  # 16 kHz waveforms for CosyVoice2 speech tokenizer
-
-        # 1. Load audio + resample to 16 kHz for the speech tokenizer
         for entry in batch:
             texts.append(entry.get("text", ""))
-            waveform, sr = sf.read(entry["audio_filepath"], dtype="float32")
-            if sr != self.COSYVOICE_SR:
-                waveform = librosa.resample(waveform, orig_sr=sr, target_sr=self.COSYVOICE_SR)
-            audio16k_list.append(waveform)
+            filepaths.append(entry["audio_filepath"])
 
-        # 2. Tokenise TEXT ONLY — audio codes are the TARGET, not a model input
+        # 1. Tokenise TEXT ONLY — audio codes are the TARGET, not a model input
         encoded = self.processor(
             text=texts,
             return_tensors="pt",
@@ -301,18 +295,16 @@ class TalkerDataCollatorPatched:
             truncation=True,
         )
 
-        # 3. Extract first-codebook speech tokens via CosyVoice2's ONNX tokenizer
-        #    frontend._extract_speech_token(speech_np [B,T], lengths_np [B]) → list of token arrays
+        # 2. Extract first-codebook speech tokens via CosyVoice2's ONNX tokenizer
+        #    _extract_speech_token(filepath) → (speech_token [1,T], speech_token_len [1])
         all_tokens = []
-        for wav in audio16k_list:
-            speech_np  = wav[np.newaxis, :].astype(np.float32)         # [1, T]
-            length_np  = np.array([speech_np.shape[1]], dtype=np.int32) # [1]
-            tokens = self._cv.frontend._extract_speech_token(speech_np, length_np)
-            tok = tokens[0] if isinstance(tokens, (list, tuple)) else tokens
-            all_tokens.append(torch.from_numpy(np.asarray(tok)).long())
+        for fp in filepaths:
+            speech_token, _ = self._cv.frontend._extract_speech_token(fp)
+            # speech_token is [1, T] int32 tensor on cv's device — flatten to [T] long
+            all_tokens.append(speech_token.squeeze(0).long().cpu())
 
         # Pad → [B, T_audio]
-        max_t      = max(t.shape[0] for t in all_tokens)
+        max_t       = max(t.shape[0] for t in all_tokens)
         audio_codes = torch.zeros(len(all_tokens), max_t, dtype=torch.long)
         for i, t in enumerate(all_tokens):
             audio_codes[i, :t.shape[0]] = t
