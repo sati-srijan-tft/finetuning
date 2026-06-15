@@ -95,6 +95,19 @@ def _patched_talker_forward(
     ).unsqueeze(0).expand(batch_size, -1)  # [B, 5]
 
     talker_emb = self.talker.get_input_embeddings()
+    _vocab = talker_emb.num_embeddings
+    _ac_min, _ac_max = int(audio_codes.min()), int(audio_codes.max())
+    if not hasattr(_patched_talker_forward, "_dbg_printed"):
+        print(f"\n[TALKER DBG] codec_embedding vocab_size={_vocab}")
+        print(f"[TALKER DBG] audio_codes range=[{_ac_min}, {_ac_max}]")
+        print(f"[TALKER DBG] special_ids={[talker_cfg.codec_nothink_id, talker_cfg.codec_think_bos_id, talker_cfg.codec_think_eos_id, talker_cfg.codec_pad_id, talker_cfg.codec_bos_id]}")
+        _patched_talker_forward._dbg_printed = True
+    if _ac_max >= _vocab:
+        raise ValueError(
+            f"audio_codes contains token ID {_ac_max} which is >= codec_embedding vocab_size {_vocab}. "
+            f"CosyVoice2 codebook range [{_ac_min},{_ac_max}] does not fit the talker vocabulary."
+        )
+
     special_embeds    = talker_emb(special_ids)           # [B, 5,          H_talker]
     audio_in_embeds   = talker_emb(audio_codes[:, :-1])   # [B, T_audio-1,  H_talker]
 
